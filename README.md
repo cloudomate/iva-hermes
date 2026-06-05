@@ -5,11 +5,16 @@ Hermes Agent **skills** for the **Iva** on-device voice assistant (Raspberry Pi
 can **pull them directly** and stay up to date independently of the device app.
 
 ```
+skills.sh.json                            # category groupings (skills.sh standard)
 skills/
   iva-hermes/SKILL.md                     # umbrella: what Iva is + its capabilities
-  device-control/
-    volume-control/SKILL.md               # speaker volume (uses the iva-volume helper)
+  volume-control/SKILL.md                 # speaker volume (uses the iva-volume helper)
 ```
+
+Skills are **flat** under `skills/<name>/SKILL.md` (the `hermes skills tap`
+enumerator lists immediate children of the tap path and looks for a `SKILL.md`
+directly inside each — nested category dirs are not auto-discovered). Categories
+are declared in the root `skills.sh.json` sidecar instead.
 
 ## How the device consumes these
 

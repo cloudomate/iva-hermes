@@ -1,0 +1,15 @@
+{
+  "$schema": "https://skills.sh/schemas/skills.sh.schema.json",
+  "name": "iva-hermes",
+  "description": "Hermes Agent skills for the Iva on-device voice assistant.",
+  "groupings": [
+    {
+      "title": "About Iva",
+      "skills": ["iva-hermes"]
+    },
+    {
+      "title": "Device Control",
+      "skills": ["volume-control"]
+    }
+  ]
+}
