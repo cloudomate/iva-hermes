@@ -47,10 +47,3 @@ what makes voice device-control reliable.
 See [`device/README.md`](device/README.md) for the full setup: backends,
 PipeWire/XVF3800 config, wake-word training, and the hard-won gotchas. The
 helper binaries (e.g. `iva-volume`) ship under `device/`, not in `skills/`.
-
-## Notes
-
-- **Public repo: no secrets.** Endpoints + API keys live in the device's
-  `~/.hermes/config.yaml`, never here.
-- The device app moved here from `aivg-devices/deploy/iva-hermes-voice/`; the
-  agent skills then moved out to [`cloudomate/skills`](https://github.com/cloudomate/skills).
