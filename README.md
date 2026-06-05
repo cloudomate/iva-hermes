@@ -4,7 +4,8 @@
 natively on a Raspberry Pi (reSpeaker XVF3800 mic array + speaker). Wake word
 **"Okay Iva"**; heavy models (LLM / STT / TTS) run on a paired backend host.
 
-This repo holds **both** the on-device app and the agent skills:
+This repo holds the **on-device app**. The agent skills live in a dedicated
+repo — [`cloudomate/skills`](https://github.com/cloudomate/skills):
 
 ```
 device/                      # the on-device app
@@ -18,30 +19,28 @@ device/                      # the on-device app
   training/                  #   local wake-word training pipeline + TRAINING.md
   README.md                  #   full device setup, backends, gotchas
 
-skills/                      # Hermes Agent skills (consumed as a tap)
-  iva-hermes/SKILL.md        #   capabilities umbrella
-  volume-control/SKILL.md    #   speaker volume via iva-volume
-skills.sh.json               # skills.sh category groupings
-install.sh                   # pull skills onto a device + register external_dirs
+install.sh                   # pull cloudomate/skills onto a device + register external_dirs
 ```
 
-## Skills (tap)
+## Skills
 
-The agent's skills are pulled directly onto devices. Either:
+The agent's skills (e.g. `volume-control`, the `iva-hermes` capabilities
+umbrella) now live in **[`cloudomate/skills`](https://github.com/cloudomate/skills)**.
+They are pulled directly onto devices. Either:
 
 ```bash
 # native tap (browse/install/update via the Skills Hub):
-hermes skills tap add cloudomate/iva-hermes
-hermes skills install cloudomate/iva-hermes/skills/volume-control
+hermes skills tap add cloudomate/skills
+hermes skills install cloudomate/skills/skills/volume-control
 
-# or in-place (clone + register in config.yaml skills.external_dirs):
+# or in-place (clone cloudomate/skills + register in config.yaml skills.external_dirs):
 curl -fsSL https://raw.githubusercontent.com/cloudomate/iva-hermes/main/install.sh | bash
 ```
 
-Skills are **flat** (`skills/<name>/SKILL.md`) so the tap enumerator discovers
-them; categories come from `skills.sh.json`. The concrete command contract for
-each capability (e.g. `iva-volume up`) is also pinned in `device/SOUL.md`, which
-Hermes auto-injects every turn — that's what makes voice device-control reliable.
+The concrete command contract for each capability (e.g. `iva-volume up`) is
+pinned both in the skill's `SKILL.md` (in `cloudomate/skills`) and in
+`device/SOUL.md` here, which Hermes auto-injects every turn — that redundancy is
+what makes voice device-control reliable.
 
 ## Device app
 
@@ -53,5 +52,5 @@ helper binaries (e.g. `iva-volume`) ship under `device/`, not in `skills/`.
 
 - **Public repo: no secrets.** Endpoints + API keys live in the device's
   `~/.hermes/config.yaml`, never here.
-- Moved here from `aivg-devices/deploy/iva-hermes-voice/` to make iva-hermes the
-  single home for the Iva-on-Hermes assistant.
+- The device app moved here from `aivg-devices/deploy/iva-hermes-voice/`; the
+  agent skills then moved out to [`cloudomate/skills`](https://github.com/cloudomate/skills).
