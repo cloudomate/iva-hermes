@@ -1,0 +1,35 @@
+#!/bin/bash
+# iva-volume — get/adjust/set the default audio sink volume, PERSISTED across
+# reboots. The persisted level is restored on boot by ensure-xvf-profile.sh
+# (ExecStartPre of hermes-voice.service), which reads the same state file.
+#
+# Usage:
+#   iva-volume up            # +1 step (default 10%)
+#   iva-volume down          # -1 step
+#   iva-volume set 50        # set to 50%  (also accepts "50%", or 0.5)
+#   iva-volume get           # print current level
+#   iva-volume restore       # re-apply the saved level (used at boot)
+#
+# Prints "volume NN%" on success. Native wpctl scale (0.0–MAX); MAX>1.0 amplifies.
+set -euo pipefail
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+STATE_DIR="$HOME/.config/iva-voice"; STATE="$STATE_DIR/volume"
+SINK="@DEFAULT_AUDIO_SINK@"
+STEP="${IVA_VOL_STEP:-0.10}"
+MAX="${IVA_VOL_MAX:-1.50}"
+mkdir -p "$STATE_DIR"
+
+cur()   { wpctl get-volume "$SINK" 2>/dev/null | awk '{print $2+0}'; }
+clamp() { awk -v v="$1" -v m="$MAX" 'BEGIN{ if(v<0)v=0; if(v>m)v=m; printf "%.2f", v }'; }
+pct()   { awk -v v="$1" 'BEGIN{printf "%d", v*100+0.5}'; }
+apply() { local v; v="$(clamp "$1")"; wpctl set-volume "$SINK" "$v" 2>/dev/null || true; printf '%s\n' "$v" >"$STATE"; printf '%s' "$v"; }
+
+cmd="${1:-get}"; arg="${2:-}"
+case "$cmd" in
+  up)      v="$(apply "$(awk -v c="$(cur)" -v s="$STEP" 'BEGIN{print c+s}')")" ;;
+  down)    v="$(apply "$(awk -v c="$(cur)" -v s="$STEP" 'BEGIN{print c-s}')")" ;;
+  set)     n="${arg%\%}"; v="$(apply "$(awk -v n="$n" 'BEGIN{ if(n>1.5) print n/100; else print n }')")" ;;
+  restore) [ -f "$STATE" ] && wpctl set-volume "$SINK" "$(cat "$STATE")" 2>/dev/null || true; v="$(cur)" ;;
+  get|*)   v="$(cur)" ;;
+esac
+echo "volume $(pct "$v")%"

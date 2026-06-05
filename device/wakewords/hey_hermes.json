@@ -1,0 +1,15 @@
+{
+  "type": "micro",
+  "wake_word": "Hey Hermes",
+  "author": "local-training (microWakeWord)",
+  "model": "hey_hermes.tflite",
+  "trained_languages": ["en"],
+  "version": 2,
+  "micro": {
+    "probability_cutoff": 0.7,
+    "feature_step_size": 10,
+    "sliding_window_size": 5,
+    "tensor_arena_size": 40000,
+    "minimum_esphome_version": "2024.7.0"
+  }
+}

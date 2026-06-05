@@ -1,47 +1,57 @@
 # iva-hermes
 
-Hermes Agent **skills** for the **Iva** on-device voice assistant (Raspberry Pi
-+ reSpeaker XVF3800, wake word "Okay Iva"). Kept in a standalone repo so devices
-can **pull them directly** and stay up to date independently of the device app.
+**Iva** — a hands-free, wake-word voice assistant running the Hermes Agent
+natively on a Raspberry Pi (reSpeaker XVF3800 mic array + speaker). Wake word
+**"Okay Iva"**; heavy models (LLM / STT / TTS) run on a paired backend host.
+
+This repo holds **both** the on-device app and the agent skills:
 
 ```
-skills.sh.json                            # category groupings (skills.sh standard)
-skills/
-  iva-hermes/SKILL.md                     # umbrella: what Iva is + its capabilities
-  volume-control/SKILL.md                 # speaker volume (uses the iva-volume helper)
+device/                      # the on-device app
+  hermes_voice_wake.py       #   headless wake->STT->agent->TTS daemon
+  hermes_voice_display.py    #   optional rich status display
+  iva-volume                 #   persisted volume helper (used by the skill)
+  SOUL.md                    #   device-control contract (auto-injected each turn)
+  ensure-xvf-profile.sh      #   boot: XVF3800 6ch profile + restore volume
+  hermes-voice.service(.d)   #   systemd user unit + override (WAKE_CUTOFF etc.)
+  wakewords/                 #   custom microWakeWord models (.tflite + .json)
+  training/                  #   local wake-word training pipeline + TRAINING.md
+  README.md                  #   full device setup, backends, gotchas
+
+skills/                      # Hermes Agent skills (consumed as a tap)
+  iva-hermes/SKILL.md        #   capabilities umbrella
+  volume-control/SKILL.md    #   speaker volume via iva-volume
+skills.sh.json               # skills.sh category groupings
+install.sh                   # pull skills onto a device + register external_dirs
 ```
 
-Skills are **flat** under `skills/<name>/SKILL.md` (the `hermes skills tap`
-enumerator lists immediate children of the tap path and looks for a `SKILL.md`
-directly inside each — nested category dirs are not auto-discovered). Categories
-are declared in the root `skills.sh.json` sidecar instead.
+## Skills (tap)
 
-## How the device consumes these
-
-Hermes discovers external skills via `skills.external_dirs` in
-`~/.hermes/config.yaml`. It scans those directories recursively for `SKILL.md`
-files (in addition to `~/.hermes/skills/`).
-
-### Install / update (on the device)
+The agent's skills are pulled directly onto devices. Either:
 
 ```bash
+# native tap (browse/install/update via the Skills Hub):
+hermes skills tap add cloudomate/iva-hermes
+hermes skills install cloudomate/iva-hermes/skills/volume-control
+
+# or in-place (clone + register in config.yaml skills.external_dirs):
 curl -fsSL https://raw.githubusercontent.com/cloudomate/iva-hermes/main/install.sh | bash
-# or, if already cloned:
-cd ~/.hermes/external-skills/iva-hermes && git pull
 ```
 
-`install.sh` clones this repo to `~/.hermes/external-skills/iva-hermes` and adds
-`~/.hermes/external-skills/iva-hermes/skills` to `skills.external_dirs` in
-`config.yaml` (idempotent). Re-run it (or `git pull`) to update — no restart of
-the voice service is needed for skill content; the skill index is re-read.
+Skills are **flat** (`skills/<name>/SKILL.md`) so the tap enumerator discovers
+them; categories come from `skills.sh.json`. The concrete command contract for
+each capability (e.g. `iva-volume up`) is also pinned in `device/SOUL.md`, which
+Hermes auto-injects every turn — that's what makes voice device-control reliable.
+
+## Device app
+
+See [`device/README.md`](device/README.md) for the full setup: backends,
+PipeWire/XVF3800 config, wake-word training, and the hard-won gotchas. The
+helper binaries (e.g. `iva-volume`) ship under `device/`, not in `skills/`.
 
 ## Notes
 
-- **Public repo: no secrets.** Skills contain only commands and device paths,
-  never API keys or endpoints (those live in the device's `config.yaml`).
-- The concrete command contract for a capability (e.g. `iva-volume up`) is also
-  pinned in the device's `~/.hermes/SOUL.md`, which Hermes auto-injects every
-  turn — this is what makes voice device-control reliable and low-latency. The
-  skills here are the documented source of truth; SOUL.md references them.
-- Helper binaries (e.g. `iva-volume`) ship with the device app
-  (`aivg-devices/deploy/iva-hermes-voice/`), not this repo.
+- **Public repo: no secrets.** Endpoints + API keys live in the device's
+  `~/.hermes/config.yaml`, never here.
+- Moved here from `aivg-devices/deploy/iva-hermes-voice/` to make iva-hermes the
+  single home for the Iva-on-Hermes assistant.
