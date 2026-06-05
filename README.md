@@ -48,10 +48,3 @@ Hermes auto-injects every turn — that's what makes voice device-control reliab
 See [`device/README.md`](device/README.md) for the full setup: backends,
 PipeWire/XVF3800 config, wake-word training, and the hard-won gotchas. The
 helper binaries (e.g. `iva-volume`) ship under `device/`, not in `skills/`.
-
-## Notes
-
-- **Public repo: no secrets.** Endpoints + API keys live in the device's
-  `~/.hermes/config.yaml`, never here.
-- Moved here from `aivg-devices/deploy/iva-hermes-voice/` to make iva-hermes the
-  single home for the Iva-on-Hermes assistant.
