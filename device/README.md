@@ -2,7 +2,7 @@
 
 A standalone, headless voice loop that turns the Hermes Agent (installed natively
 on iva) into a hands-free **"Hey Hermes" / "Hey Iva"** smart speaker, using the
-XVF3800 mic array for input and Mac-hosted models for the heavy lifting. No TUI —
+XVF3800 mic array for input and a paired backend host for the heavy lifting. No TUI —
 runs as a `systemctl --user` service. An optional `rich` status display can be
 shown on an attached screen.
 
@@ -13,8 +13,8 @@ The wake words are custom microWakeWord models trained locally — see
 
 ```
 "Hey Hermes" / "Hey Iva" (microWakeWord, FL channel)
-   -> beep -> record-to-silence (FL) -> Whisper STT (Mac)
-   -> Hermes AIAgent (Mac Ollama) -> Kokoro TTS (Mac) -> play
+   -> beep -> record-to-silence (FL) -> Whisper STT (backend)
+   -> Hermes AIAgent (backend LLM) -> Kokoro TTS (backend) -> play
    -> 5s hands-free follow-up window -> sleep (beep)
 ```
 
@@ -44,37 +44,40 @@ low-latency triggering relies on the concrete command contract being pinned in
 source of truth. The `iva-volume` helper itself ships here under `device/` (it's
 a device binary, not a skill).
 
-## Backends (run on the Mac, reachable from iva as `ys-mbp-01.local`)
+## Backends (run on a paired host, reachable from iva as `<backend-host>`)
 
 | Service | Port | What |
 |---|---|---|
-| Ollama (LLM) | 11434 | `qwen3.5:35b-mlx` (OpenAI-compatible `/v1`) |
-| whisper.cpp (STT) | 8003 | `ggml-large-v3-turbo`, OpenAI `/v1/audio/transcriptions` |
-| Kokoro-FastAPI (TTS) | 8880 | OpenAI `/v1/audio/speech`, voice `af_heart`, 24 kHz |
+| Ollama (LLM) | 11434 | OpenAI-compatible `/v1` chat (model is whatever the host loaded) |
+| whisper.cpp (STT) | 8003 | OpenAI `/v1/audio/transcriptions` (e.g. `ggml-large-v3-turbo`) |
+| Kokoro-FastAPI (TTS) | 8004 | OpenAI `/v1/audio/speech`, voice `af_heart`, 24 kHz |
 
-iva reaches the Mac over the direct link (`ys-mbp-01.local` -> 192.168.2.1).
+`<backend-host>` is whatever name resolves to the paired host from iva (mDNS
+`.local`, DNS, or a `/etc/hosts` entry); the original setup used a direct link to
+a Mac, but any host on the network exposing the three OpenAI-compatible
+endpoints works.
 
 ## Hermes config.yaml changes (the integration)
 
 ```yaml
-model:                         # LLM -> Mac Ollama
+model:                         # LLM -> backend Ollama
   default: qwen3.5:35b-mlx
   provider: custom
-  base_url: http://ys-mbp-01.local:11434/v1
+  base_url: http://<backend-host>:11434/v1
   api_key: sk-local
-stt:                           # STT -> Mac whisper.cpp
+stt:                           # STT -> backend whisper.cpp
   enabled: true
   provider: openai
   openai:
-    base_url: http://ys-mbp-01.local:8003/v1
+    base_url: http://<backend-host>:8003/v1
     model: whisper-1
     api_key: sk-local          # REQUIRED: without it the resolver falls back to
                                # api.openai.com and 401s (see transcription_tools
                                # _resolve_openai_audio_client_config)
-tts:                           # TTS -> Mac Kokoro
+tts:                           # TTS -> backend Kokoro
   provider: openai
   openai:
-    base_url: http://ys-mbp-01.local:8880/v1
+    base_url: http://<backend-host>:8004/v1
     model: kokoro
     voice: af_heart
     api_key: sk-local
@@ -86,7 +89,7 @@ voice:
 `.env`: `OPENAI_API_KEY=sk-local` (the audio OpenAI clients read it; Kokoro/whisper ignore the value).
 
 NOTE: the `model:`/`whisper-1`/`kokoro` strings are just OpenAI API labels — the
-actual models are whatever each Mac server loaded (large-v3-turbo, kokoro-v1_0).
+actual models are whatever each backend server loaded (e.g. large-v3-turbo, kokoro-v1_0).
 
 ## venv packages added (voice deps the installer omitted)
 
