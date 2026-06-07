@@ -16,7 +16,7 @@ export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 STATE_DIR="$HOME/.config/iva-voice"; STATE="$STATE_DIR/volume"
 SINK="@DEFAULT_AUDIO_SINK@"
 STEP="${IVA_VOL_STEP:-0.10}"
-MAX="${IVA_VOL_MAX:-1.50}"
+MAX="${IVA_VOL_MAX:-2.50}"
 mkdir -p "$STATE_DIR"
 
 cur()   { wpctl get-volume "$SINK" 2>/dev/null | awk '{print $2+0}'; }
@@ -28,7 +28,7 @@ cmd="${1:-get}"; arg="${2:-}"
 case "$cmd" in
   up)      v="$(apply "$(awk -v c="$(cur)" -v s="$STEP" 'BEGIN{print c+s}')")" ;;
   down)    v="$(apply "$(awk -v c="$(cur)" -v s="$STEP" 'BEGIN{print c-s}')")" ;;
-  set)     n="${arg%\%}"; v="$(apply "$(awk -v n="$n" 'BEGIN{ if(n>1.5) print n/100; else print n }')")" ;;
+  set)     n="${arg%\%}"; v="$(apply "$(awk -v n="$n" -v m="$MAX" 'BEGIN{ if(n>m) print n/100; else print n }')")" ;;
   restore) [ -f "$STATE" ] && wpctl set-volume "$SINK" "$(cat "$STATE")" 2>/dev/null || true; v="$(cur)" ;;
   get|*)   v="$(cur)" ;;
 esac

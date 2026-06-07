@@ -32,7 +32,8 @@ The single most important file. A headless `systemctl --user` daemon implementin
 ```
 wake (microWakeWord, FL channel) -> beep -> record-to-silence (FL)
   -> Whisper STT (backend) -> Hermes AIAgent (backend LLM) -> Kokoro TTS (backend)
-  -> play -> 5s hands-free follow-up window -> sleep (beep)
+  -> play (barge-in armed) -> reply directive: [[stay]] keeps mic open
+                                              [[sleep]] beeps + back to wake
 ```
 
 Heavy models (LLM/STT/TTS) run on a **paired backend host** reached over the
@@ -65,13 +66,28 @@ list, but the critical ones:
    stored in history/memory.
 5. **Adaptive RMS thresholds** auto-tune to the room: `noise_floor` is an EMA of
    FL RMS that only adapts to quiet samples (so speech doesn't inflate it).
+6. **LLM controls the ears.** There is no acoustic followup timer anymore. Each
+   reply ends with `[[stay]]` or `[[sleep]]` (contract in `SOUL.md`), parsed
+   and stripped by `parse_directive()` before TTS. `[[stay]]` reopens the mic
+   with no wake gate; `[[sleep]]` returns to wake-only. Safety net:
+   `LISTENING_IDLE_TIMEOUT` (12 s) drops back to wake-only if the model says
+   `[[stay]]` but no one speaks. Don't reintroduce a fixed `FOLLOWUP_SECONDS`
+   window — the whole point of the redesign was to remove acoustic guessing.
+7. **Barge-in concurrency.** `speak()` is non-blocking and a daemon thread
+   monitors the FL mic with a sustained-RMS gate during playback (constraint
+   #2's segfault was input-stream → input-stream re-entry; input + output
+   concurrent under PipeWire works). On a hit, `sd.stop()` cuts TTS and the
+   next user turn captures the interrupting utterance; the partial assistant
+   message gets a `[interrupted]` suffix in history so the model knows not to
+   resume the previous reply.
 
 ### Tuning knobs (env, mostly via the systemd override)
 
 `WAKE_CUTOFF` (wake sensitivity, lower = more sensitive), `WAKE_CH` (0=FL, 1=FR),
 `WAKE_MODELS_DIR`, `SPEECH_MULT`/`SPEECH_MIN` (adaptive threshold),
-`FOLLOWUP_SECONDS`, `WAKE_DEBUG=1` (logs wake `peak prob_mean` for diagnosing
-voice-mismatch vs cutoff problems).
+`LISTENING_IDLE_TIMEOUT` (stay-mode dropback, 12 s), `BARGE_HITS_NEEDED` /
+`BARGE_RMS_MULT` (barge-in monitor tuning), `WAKE_DEBUG=1` (logs wake `peak
+prob_mean` for diagnosing voice-mismatch vs cutoff problems).
 
 ## Skills (now in cloudomate/skills)
 

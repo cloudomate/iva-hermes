@@ -15,7 +15,8 @@ The wake words are custom microWakeWord models trained locally — see
 "Hey Hermes" / "Hey Iva" (microWakeWord, FL channel)
    -> beep -> record-to-silence (FL) -> Whisper STT (backend)
    -> Hermes AIAgent (backend LLM) -> Kokoro TTS (backend) -> play
-   -> 5s hands-free follow-up window -> sleep (beep)
+   -> reply directive ([[stay]] -> mic open / [[sleep]] -> beep, wake-only)
+   -> barge-in: user speech during TTS cuts playback and jumps to recording
 ```
 
 ## Components / files (on iva)
@@ -146,9 +147,13 @@ wpctl set-volume @DEFAULT_AUDIO_SINK@ 1.4
 
 - `WAKE_CUTOFF` (env, override.conf) — wake sensitivity (0.5 default).
 - `WAKE_CH` (env) — 0=FL, 1=FR.
-- `FOLLOWUP_SECONDS` (5.0) — hands-free window after a reply.
-- `FOLLOWUP_RMS` (1000) — speech threshold to chain a follow-up.
-- `record_to_silence(silence_s=1.5, rms_thresh=800, start_timeout_s=8)`.
+- `LISTENING_IDLE_TIMEOUT` (12.0) — after `[[stay]]`, how long to wait for
+  the user to speak before dropping back to wake-only.
+- `BARGE_HITS_NEEDED` (3) — consecutive over-threshold blocks (~80 ms each)
+  before TTS playback is interrupted.
+- `BARGE_RMS_MULT` (1.5) — multiplier on `speech_threshold()` for the
+  barge-in bar; higher = less likely to trip on TTS loopback / room noise.
+- `record_to_silence(silence_s=1.5, rms_thresh=speech_threshold(), start_timeout_s=8)`.
 
 ## Manage
 
@@ -185,7 +190,21 @@ recalled across restarts/reboots — independent of conversation length.
 `noise_floor` is an EMA of FL RMS while listening (only adapts to quiet samples, so
 speech doesn't inflate it); `speech_threshold() = max(SPEECH_MIN, noise_floor *
 SPEECH_MULT)` (env `SPEECH_MULT`=3.0, `SPEECH_MIN`=450). Used for command-recording
-onset/endpoint and the follow-up window. State JSON now also exposes `noise`/`thresh`.
+onset/endpoint and (scaled by `BARGE_RMS_MULT`) for the barge-in monitor during
+TTS. State JSON now also exposes `noise`/`thresh`.
+
+**LLM-driven session state.** "End of conversation" is decided by the model,
+not a fixed acoustic timer. Every reply ends with `[[stay]]` (keep mic open
+for follow-up) or `[[sleep]]` (return to wake-only). The directive is stripped
+before TTS and before being saved to history. The contract is in
+[`SOUL.md`](SOUL.md). Safety net: if the model says `[[stay]]` but no one
+speaks for `LISTENING_IDLE_TIMEOUT` seconds, the daemon drops back to SLEEP.
+
+**Barge-in.** TTS playback is non-blocking; a daemon thread monitors the FL
+mic with a sustained-RMS gate during playback. On a hit, `sd.stop()` cuts
+audio immediately and the next user turn captures the interrupting utterance.
+The interrupted assistant message gets a `[interrupted]` suffix in history so
+the model doesn't try to resume the old reply.
 
 **Reminder:** `config.yaml`, `.env`, and `memory.provider` live on iva, not in git —
 this dir is the source-of-truth copy of the *scripts*; the README documents the

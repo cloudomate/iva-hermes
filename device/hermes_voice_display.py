@@ -31,7 +31,7 @@ def read_state():
 def render(s):
     st = s.get("state","offline"); color = COLORS.get(st,"white")
     wake = s.get("wake_name") or "the wake word"
-    label = LABEL.get(st) or (f"Say '{wake}'" if st == "listening" else st.upper())
+    label = LABEL.get(st) or (f"Listening for '{wake}'" if st == "listening" else st.upper())
     big = Text(label, style=f"{color}", justify="center")
     big.stylize("bold")
     tbl = Table.grid(expand=True); tbl.add_column(justify="left", overflow="fold")
