@@ -11,23 +11,40 @@ speaker). This repo is the **source-of-truth copy of the on-device app** — it 
 (`/home/iva/...`) and into Hermes (`~/.hermes/...`); paths in the scripts are
 hardcoded to those device locations, not this repo.
 
-This repo:
-- `device/` — the on-device app (wake daemon, helpers, systemd unit, wake-word
-  models + training pipeline).
-- `install.sh` — pulls the agent skills onto a device and registers them in
-  `config.yaml` (`skills.external_dirs`).
+This repo is a **Python package** (`iva`, src layout):
+- `src/iva/` — the on-device app as an importable package. `cli.py` is the
+  single **`iva`** entry point (`iva run` = the daemon, `iva install`, `iva
+  display`, `iva volume`, `iva audio`, `iva devices`). Modules: `wake.py` (daemon),
+  `display.py`, `audio.py` + `volume.py` (also exposed as `iva-audio`/`iva-volume`
+  aliases), `narration_filter.py`, `speaker_gate.py`, `service.py` (the `iva
+  install` systemd setup), `devices.py`, and `data/SOUL.md` (package data).
+  Greenfield is `pip install iva-hermes && iva run` — no repo clone; deps pull
+  `hermes-agent` + the audio stack (`pymicro-wakeword` = the microWakeWord
+  runtime). The wake-word **models** are bundled here as package data
+  (`src/iva/data/wakewords/`). `iva install` is *optional* (a systemd --user unit
+  whose `ExecStart` is `iva run`). The training pipeline that makes new models
+  lives in `cloudomate/iva-wakeword` (training-only, not a runtime dep).
+- `deploy/` — non-Python deploy artifacts: the systemd unit + override,
+  `ensure-xvf-profile.sh`, and `install-device.sh` (pip-installs the package
+  into the Hermes venv, symlinks the entry points to `~/.local/bin`, installs
+  the unit + wake-word models).
+- `pyproject.toml` — packaging (hatchling); entry points `iva-audio`, `iva-volume`.
+- `install.sh` — separate concern: pulls the agent skills (cloudomate/skills)
+  onto a device and registers them in `config.yaml` (`skills.external_dirs`).
 
 The **agent skills live in a separate repo**,
 [`cloudomate/skills`](https://github.com/cloudomate/skills) (anthropics/skills-style
 monorepo). They are consumed by the device as a "tap" or via `skills.external_dirs`.
 
-There is **no build/test/lint tooling** in this repo — it's deployment scripts,
-Python daemons that run on the Pi, and Markdown skill/doc files. Validate Python
-with `python3 -m py_compile device/*.py` and shell with `bash -n device/*.sh`.
+Build with `uv build` (or `python -m build`) — hatchling, src layout. There is
+no test/lint tooling; validate Python with `python3 -m py_compile src/iva/*.py`
+and shell with `bash -n deploy/*.sh`. The daemon's runtime also needs the ambient
+**Hermes Agent** (`run_agent`, `tools.*` at `~/.hermes/hermes-agent`), which is
+NOT a pip dependency — `iva.wake` injects that path on `sys.path` itself.
 
-## The runtime pipeline (device/hermes_voice_wake.py)
+## The runtime pipeline (src/iva/wake.py — `iva run`)
 
-The single most important file. A headless `systemctl --user` daemon implementing:
+The single most important module. A headless `systemctl --user` daemon implementing:
 
 ```
 wake (microWakeWord, FL channel) -> beep -> record-to-silence (FL)
@@ -39,18 +56,25 @@ wake (microWakeWord, FL channel) -> beep -> record-to-silence (FL)
 Heavy models (LLM/STT/TTS) run on a **paired backend host** reached over the
 network; the Pi only runs the wake loop, orchestration, and hardware control.
 The daemon publishes live state to `$XDG_RUNTIME_DIR/hermes-voice/state.json`,
-which `hermes_voice_display.py` (optional `rich` UI) reads.
+which `iva.display` (optional `rich` UI) reads.
 
 ### Non-obvious design constraints (read before editing the daemon)
 
 These are hard-won and easy to regress — the device README documents the full
 list, but the critical ones:
 
-1. **Wake input is the FL channel of a 6-channel capture, not the default
-   device.** The XVF3800's PipeWire `analog-surround-51` profile exposes 6
-   channels (FL FR FC LFE RL RR). sounddevice's default mono *downmixes* all 6,
-   diluting the voice ~5× so wake never fires. The daemon opens 6ch and extracts
-   channel 0 (`WAKE_CH`). `ensure-xvf-profile.sh` forces this profile at boot.
+1. **Audio is generic (PipeWire/sounddevice) and config-driven; multi-channel
+   arrays must be pinned.** Resolution lives in `iva/audio_config.py`: a named
+   **preset** supplies defaults (`generic` = system default + mono; built-in
+   `respeaker-xvf3800` = 6ch + extract ch0), chosen via `IVA_AUDIO_PRESET` /
+   `~/.config/iva-voice/audio.yaml` (`preset:`) / `iva run --preset`. The user
+   file can define custom presets + `overrides:`. Env always wins:
+   `AUDIO_SOURCE`/`AUDIO_SINK` (name substring or index → `sd.default.device`),
+   `AUDIO_CHANNELS` (capture count; unset = auto-try 6 then mono), `WAKE_CH`
+   (channel `read_fl()` extracts when channels > 1). **XVF3800 is one such preset:** its `analog-surround-51`
+   profile exposes 6ch (FL FR FC LFE RL RR) whose default mono *downmixes* +
+   dilutes the voice ~5×, so set `AUDIO_CHANNELS=6 WAKE_CH=0` and force the
+   profile with `ensure-xvf-profile.sh`. Use `iva devices` to find node names.
 2. **Do NOT use Hermes' bundled `create_audio_recorder()`.** Opening its threaded
    PortAudio stream right after the wake stream closed caused a **hard segfault**
    (PortAudio re-entrancy). `record_to_silence()` is a deliberate
@@ -98,36 +122,49 @@ discovers them; categories come from that repo's `skills.sh.json`.
 The concrete command contract for each capability (e.g. the exact `iva-volume`
 sub-commands) is **pinned in places that must stay in sync** — and they now span
 two repos: in `cloudomate/skills` both `skills/<name>/SKILL.md` and the umbrella
-`skills/iva-hermes/SKILL.md` table; in **this** repo `device/SOUL.md`. `SOUL.md`
+`skills/iva-hermes/SKILL.md` table; in **this** repo `src/iva/data/SOUL.md`. `SOUL.md`
 is auto-injected into Hermes every turn — that redundancy is intentional and is
 what makes low-latency voice device-control reliable. When you change a helper's
 interface, update all of them (across both repos).
 
 ## Device helpers
 
-`device/iva-volume` is a **device binary, not a skill** (it ships under `device/`,
-runs on the Pi at `/home/iva/.local/bin/iva-volume`). It wraps `wpctl` but
-**persists** the level to `~/.config/iva-voice/volume`, which
+`iva.volume` / `iva.audio` are **device helpers, not skills** — package modules
+exposed as the `iva-volume` / `iva-audio` console entry points and symlinked to
+`/home/iva/.local/bin/` (the path SOUL.md and the skills reference). `iva-volume`
+wraps `wpctl` but **persists** the level to `~/.config/iva-voice/volume`, which
 `ensure-xvf-profile.sh` restores at boot. The persistence is the whole point —
 skills and SOUL.md both forbid calling `wpctl`/`pactl` directly because those
-don't survive a reboot.
+don't survive a reboot. (`iva-volume` was a bash script; it's now a
+behaviour-preserving Python port, `IVA_VOL_MAX` default 2.50.)
 
-## Wake-word training (device/training/)
+## Wake words: runtime vs training
 
-Custom microWakeWord models are trained on a Mac with
-[OHF-Voice/micro-wake-word](https://github.com/OHF-Voice/micro-wake-word); the
-quantized `.tflite` + `.json` manifests land in `device/wakewords/` (mirrored to
-`/home/iva/wakewords/` on the device). The daemon auto-loads every `*.json` there,
-falling back to bundled `hey_jarvis`. **Okay Iva** is the active model. See
-`device/training/TRAINING.md` for the full pipeline, the required numpy/torch
-patches, and the empirical wake-word design lessons (syllable count dominates
+**Runtime** = `pymicro-wakeword` (the microWakeWord inference engine, a pip dep).
+The active **models** ship bundled in this package at `src/iva/data/wakewords/`;
+the daemon auto-loads every `*.json` in `WAKE_MODELS_DIR` (default falls back to
+that bundled dir, then to pymicro's `hey_jarvis`). **Okay Iva** is active.
+
+**Training** lives in a separate repo,
+[`cloudomate/iva-wakeword`](https://github.com/cloudomate/iva-wakeword) — the
+pipeline (run on a Mac with
+[OHF-Voice/micro-wake-word](https://github.com/OHF-Voice/micro-wake-word)) and
+the trained artifacts. It is **training-only, not a runtime dependency**. To ship
+a new wake word, copy its produced `.tflite` + `.json` into
+`src/iva/data/wakewords/` here and release. See that repo's `training/TRAINING.md`
+for the pipeline and the empirical design lessons (syllable count dominates
 accuracy; synthetic Piper audio often mismatches the real speaker → train on real
-recordings). The `prep_*.py` scripts and `training_parameters_*.yaml` are reusable
-templates.
+recordings).
 
 ## Deploy / manage
 
 ```bash
+# Install/run the device app (greenfield — no clone). Pulls hermes-agent + audio
+# stack; wake models are bundled in the package:
+pip install iva-hermes && iva run
+# optional autostart on boot: `iva install` (systemd --user unit, ExecStart=iva run)
+# helpers: iva volume up | iva audio record 5 | iva devices | iva presets
+
 # Install/update skills (from cloudomate/skills) on a device and wire them into config.yaml:
 curl -fsSL https://raw.githubusercontent.com/cloudomate/iva-hermes/main/install.sh | bash
 # or the native tap: hermes skills tap add cloudomate/skills

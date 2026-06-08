@@ -1,0 +1,59 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "iva-hermes"
+description = "Iva — the on-device, wake-word voice assistant (Hermes Agent, hardware-agnostic via PipeWire)"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT" }
+authors = [{ name = "Iva / Hermes Agent" }]
+keywords = ["voice-assistant", "wake-word", "raspberry-pi", "hermes", "microwakeword", "kokoro", "pipewire"]
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Operating System :: POSIX :: Linux",
+    "Topic :: Multimedia :: Sound/Audio :: Capture/Recording",
+    "Environment :: No Input/Output (Daemon)",
+]
+dynamic = ["version"]
+
+# Greenfield: `pip install iva-hermes` pulls everything needed to `iva run`.
+# The wake-word MODELS are bundled here as package data (src/iva/data/wakewords);
+# `pymicro-wakeword` is the microWakeWord *runtime* that loads + scores them.
+# (The training pipeline that produces new models lives in cloudomate/iva-wakeword
+# and is NOT a runtime dependency.)
+dependencies = [
+    "numpy",
+    "sounddevice",            # capture/playback via PortAudio -> PipeWire
+    "soundfile",
+    "pymicro-wakeword",       # microWakeWord runtime (inference)
+    "hermes-agent",           # the agent runtime (run_agent, tools.*, hermes_cli)
+    "pyyaml",                 # iva config / audio presets read+write
+]
+
+[project.optional-dependencies]
+display = ["rich"]            # optional state UI (iva display)
+
+[project.scripts]
+# One umbrella CLI plus name-compatible aliases (SOUL.md / skills call the
+# helpers by their bare names at /home/iva/.local/bin/).
+iva = "iva.cli:main"
+iva-audio = "iva.audio:main"
+iva-volume = "iva.volume:main"
+
+[project.urls]
+Homepage = "https://github.com/cloudomate/iva-hermes"
+Repository = "https://github.com/cloudomate/iva-hermes"
+"Wake-word training" = "https://github.com/cloudomate/iva-wakeword"
+
+[tool.hatch.version]
+path = "src/iva/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/iva"]
+# Ship SOUL.md as package data (force-include since .md isn't a Python source).
+artifacts = [
+    "src/iva/data/**",
+]

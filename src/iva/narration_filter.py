@@ -6,7 +6,7 @@ verbalize state metadata the user shouldn't have to hear out loud — the
 [[stay]] / [[sleep]] directive already conveys session state silently.
 
 `is_narration(sentence)` returns True if the sentence is pure filler and
-should be dropped from TTS. The daemon (`hermes_voice_wake.py`) calls it
+should be dropped from TTS. The daemon (`iva.wake`) calls it
 inside the streaming sentence segmenter, gated to fire only after a real
 content sentence has already played this turn — so a legitimately short
 reply like "I'm listening." in response to "are you there?" still gets

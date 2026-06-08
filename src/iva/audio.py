@@ -1,11 +1,11 @@
-#!/home/iva/.hermes/hermes-agent/venv/bin/python
+#!/usr/bin/env python3
 """iva-audio — record from the mic and play audio out the speaker, the SAME way
 the voice daemon does it (so it actually works on this hardware).
 
 Why a standalone helper (not raw arecord/aplay, not code in the daemon):
   * The XVF3800 exposes a 6-channel capture (FL FR FC LFE RL RR). A plain mono
     capture DOWNMIXES all 6 and dilutes the voice ~5x. We open 6ch and extract
-    the FL channel (WAKE_CH=0), exactly like hermes_voice_wake.py.
+    the FL channel (WAKE_CH=0), exactly like iva.wake.
   * Playing goes through sounddevice/sd.play to the default sink (the proven
     path the daemon uses for replies); ffplay can pick the wrong device.
   * This is a SEPARATE process from the daemon, so it has its own PortAudio
@@ -40,11 +40,34 @@ import soundfile as sf
 
 RATE = 16000
 BLOCK = 1280
-WAKE_CH = int(os.environ.get("WAKE_CH", "0"))      # 0=FL, 1=FR
 SPEECH_MULT = float(os.environ.get("SPEECH_MULT", "3.0"))
 SPEECH_MIN = float(os.environ.get("SPEECH_MIN", "450"))
 REC_MAX = float(os.environ.get("IVA_REC_MAX", "60"))   # hard cap on any recording
 REC_DIR = os.path.expanduser("~/.local/share/iva-voice/recordings")
+
+# Same device-preset resolution as the daemon (preset + user file + env).
+from iva.audio_config import resolve as _resolve_audio
+_AUDIO = _resolve_audio()
+WAKE_CH = _AUDIO["wake_channel"]
+AUDIO_SOURCE = _AUDIO["source"]
+AUDIO_SINK = _AUDIO["sink"]
+AUDIO_CHANNELS = _AUDIO["channels"]
+
+
+def _apply_default_devices():
+    def _r(s):
+        if s is None:
+            return None
+        try:
+            return int(s)
+        except (TypeError, ValueError):
+            return s
+    src, snk = _r(AUDIO_SOURCE), _r(AUDIO_SINK)
+    if src is not None or snk is not None:
+        sd.default.device = (src, snk)
+
+
+_apply_default_devices()
 
 
 def die(msg, code=1):
@@ -53,8 +76,11 @@ def die(msg, code=1):
 
 
 def open_input():
-    """Open input; prefer 6ch (to extract FL), fall back to mono — like the daemon."""
-    for ch in (6, 1):
+    """Open the capture stream. AUDIO_CHANNELS pins the channel count (e.g. 6 for
+    the XVF3800); unset = auto (try 6ch then mono). read_fl() extracts WAKE_CH
+    only when channels > 1."""
+    candidates = (int(AUDIO_CHANNELS),) if AUDIO_CHANNELS else (6, 1)
+    for ch in candidates:
         try:
             s = sd.RawInputStream(samplerate=RATE, channels=ch, dtype="int16", blocksize=BLOCK)
             s.start()
@@ -233,7 +259,9 @@ def play_last():
     play(files[-1])
 
 
-def main(argv):
+def main(argv=None):
+    if argv is None:
+        argv = sys.argv[1:]
     if not argv:
         die(__doc__)
     cmd = argv[0]
@@ -263,4 +291,4 @@ def main(argv):
 
 
 if __name__ == "__main__":
-    main(sys.argv[1:])
+    main()

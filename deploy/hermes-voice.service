@@ -7,7 +7,9 @@ Type=simple
 Environment=OPENAI_API_KEY=sk-local
 Environment=PYTHONUNBUFFERED=1
 WorkingDirectory=/home/iva/.hermes/hermes-agent
-ExecStart=/home/iva/.hermes/hermes-agent/venv/bin/python /home/iva/hermes_voice_wake.py
+# Runs the daemon from the installed `iva` package (pip install into the Hermes
+# venv). The package's wake module injects the Hermes path itself.
+ExecStart=/home/iva/.hermes/hermes-agent/venv/bin/python -m iva.wake
 Restart=on-failure
 RestartSec=3
 

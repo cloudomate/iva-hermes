@@ -25,7 +25,31 @@ import numpy as np, sounddevice as sd
 from pymicro_wakeword import MicroWakeWord, MicroWakeWordFeatures, Model
 
 RATE = 16000; BLOCK = 1280
-WAKE_CH = int(os.environ.get("WAKE_CH", "0"))     # 0=FL, 1=FR (XVF3800 6ch: FL FR FC LFE RL RR)
+# --- audio device selection: a named preset (e.g. respeaker-xvf3800) supplies
+# defaults; ~/.config/iva-voice/audio.yaml + env (AUDIO_SOURCE/SINK/CHANNELS/
+# WAKE_CH) override. See iva/audio_config.py. ---
+from iva.audio_config import resolve as _resolve_audio
+_AUDIO = _resolve_audio()
+WAKE_CH = _AUDIO["wake_channel"]            # channel read_fl() extracts when multi-channel
+AUDIO_SOURCE = _AUDIO["source"]             # device name substring / index / None=default
+AUDIO_SINK = _AUDIO["sink"]
+AUDIO_CHANNELS = _AUDIO["channels"]         # int, or None = auto (try 6 then mono)
+print(f"[audio] preset={_AUDIO['preset']} source={AUDIO_SOURCE!r} sink={AUDIO_SINK!r} "
+      f"channels={AUDIO_CHANNELS} wake_ch={WAKE_CH}", flush=True)
+
+def _resolve_dev(spec):
+    if spec is None:
+        return None
+    try:
+        return int(spec)            # device index
+    except (TypeError, ValueError):
+        return spec                 # sounddevice matches a name substring
+
+def _apply_default_devices():
+    src, snk = _resolve_dev(AUDIO_SOURCE), _resolve_dev(AUDIO_SINK)
+    if src is not None or snk is not None:
+        sd.default.device = (src, snk)
+_apply_default_devices()
 WAKE_CUTOFF = float(os.environ.get("WAKE_CUTOFF", "0.5"))
 # Stay-mode safety: if LLM says [[stay]] but user never speaks, drop back to SLEEP.
 LISTENING_IDLE_TIMEOUT = float(os.environ.get("LISTENING_IDLE_TIMEOUT", "12.0"))
@@ -87,7 +111,16 @@ def beep_wake():  beep([(660,0.10),(990,0.12)])
 def beep_sleep(): beep([(660,0.10),(440,0.14)])
 
 publish("loading")
-WAKE_MODELS_DIR = os.environ.get("WAKE_MODELS_DIR", "/home/iva/wakewords")
+def _default_wake_models_dir():
+    """WAKE_MODELS_DIR env wins; else the device dir if present; else the
+    wake-word models bundled with this package (greenfield pip install)."""
+    env = os.environ.get("WAKE_MODELS_DIR")
+    if env:
+        return env
+    if os.path.isdir("/home/iva/wakewords"):
+        return "/home/iva/wakewords"
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "wakewords")
+WAKE_MODELS_DIR = _default_wake_models_dir()
 def _set_cutoff(m):
     try: m.probability_cutoff = WAKE_CUTOFF
     except Exception: pass
@@ -182,30 +215,50 @@ except Exception:
 last_activity=[0.0]
 
 def _warmup_llm():
-    """Send a throwaway request through the full Hermes pipeline so the
-    Ollama slot's KV cache is populated with our typical prompt prefix
-    (system + tool defs + history). Without this, the first real wake
-    after a daemon restart pays ~10-12s of cold-cache prefill. Runs in a
-    daemon thread so the main loop comes up immediately."""
+    """Prime the LLM KV cache with the REAL turn prefix by running a throwaway
+    turn through the SAME path do_turn uses (VOICE_HINT + tools + memory +
+    history) — so the cached prefix matches the first real wake and is reused.
+    (A bare prompt primes a different, tiny prefix that never gets reused.)
+    No persist_user_message, so it doesn't pollute the conversation history."""
     try:
         t0 = time.monotonic()
-        agent.run_conversation(
-            "warmup ping — reply with just 'ok'",
-            conversation_history=history,
-        )
-        print(f"[warmup] llm KV-cache primed in {time.monotonic()-t0:.1f}s", flush=True)
+        agent.run_conversation(VOICE_HINT + "warm up — reply with just ok",
+                               conversation_history=history,
+                               stream_callback=lambda _d: None)
+        print(f"[warmup] primed (real prefix) in {time.monotonic()-t0:.1f}s", flush=True)
+        return True
     except Exception as e:
-        print(f"[warmup] failed (non-fatal): {e}", flush=True)
-threading.Thread(target=_warmup_llm, daemon=True).start()
+        print(f"[warmup] attempt failed (non-fatal): {e}", flush=True)
+        return False
+
+# Warm up on every start/restart BEFORE serving, so the first turn has no
+# cold-start delay. IVA_WARMUP=sync (default, blocks until primed; retries while
+# the backend is still coming up) | async (background, old behaviour) | off.
+_WARMUP = (os.environ.get("IVA_WARMUP") or "sync").strip().lower()
+if _WARMUP == "off":
+    print("[warmup] disabled (IVA_WARMUP=off)", flush=True)
+elif _WARMUP == "async":
+    threading.Thread(target=_warmup_llm, daemon=True).start()
+else:
+    _retries = int(os.environ.get("IVA_WARMUP_RETRIES", "6"))
+    print("[warmup] priming before serving (IVA_WARMUP=sync)...", flush=True)
+    for _i in range(max(1, _retries)):
+        if _warmup_llm():
+            break
+        time.sleep(3)   # backend may still be starting
 
 def open_input():
-    """Open input; prefer 6ch (to extract FL), fall back to mono."""
-    for ch in (6,1):
+    """Open the capture stream. AUDIO_CHANNELS pins the channel count (e.g. 6 for
+    the XVF3800); unset = auto (try 6ch then mono). Device follows sd.default
+    (AUDIO_SOURCE). read_fl() extracts WAKE_CH only when channels > 1."""
+    candidates = (int(AUDIO_CHANNELS),) if AUDIO_CHANNELS else (6, 1)
+    last = None
+    for ch in candidates:
         try:
             s=sd.RawInputStream(samplerate=RATE,channels=ch,dtype="int16",blocksize=BLOCK); s.start(); print(f"[input] opened {ch}ch",flush=True); return s,ch
         except Exception as e:
-            print(f"[input] {ch}ch failed: {e}",flush=True)
-    raise RuntimeError("no input stream")
+            last = e; print(f"[input] {ch}ch failed: {e}",flush=True)
+    raise RuntimeError(f"no input stream: {last}")
 
 def read_fl(stream,ch):
     data,_=stream.read(BLOCK)
@@ -278,15 +331,15 @@ def strip_directives(text):
 
 # Narration / filler detector lives in a separate module so its vocabulary
 # can be tuned and the whole filter can be disabled via env var
-# (NARRATION_FILTER=0). See device/narration_filter.py.
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from narration_filter import is_narration  # noqa: E402
-print(f"[init] narration_filter enabled={__import__('narration_filter').is_enabled()}", flush=True)
+# (NARRATION_FILTER=0). See iva/narration_filter.py.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # fallback for sibling import
+from iva.narration_filter import is_narration, is_enabled as _nf_enabled  # noqa: E402
+print(f"[init] narration_filter enabled={_nf_enabled()}", flush=True)
 
 # Speaker-verification gate (opt-in via SPEAKER_GATE=1). Embeds the captured
 # turn wav with ECAPA-TDNN and compares to a cached enrollment; rejects
-# loopback / other-speaker recordings before Whisper. See device/speaker_gate.py.
-from speaker_gate import maybe_build as _maybe_build_gate  # noqa: E402
+# loopback / other-speaker recordings before Whisper. See iva/speaker_gate.py.
+from iva.speaker_gate import maybe_build as _maybe_build_gate  # noqa: E402
 _speaker_gate = _maybe_build_gate(log=lambda m: print(m, flush=True))
 
 # If the assistant's reply *itself* says goodbye, treat the session as closing
