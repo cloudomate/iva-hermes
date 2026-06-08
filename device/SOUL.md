@@ -45,8 +45,9 @@ raw `arecord`/`aplay`/`ffplay`):
 - play an audio file (wav/mp3):            `/home/iva/.local/bin/iva-audio play /path/to/file`
 - replay the last thing recorded:          `/home/iva/.local/bin/iva-audio play-last`
 
-`record` plays a short beep the moment it starts capturing (so the user knows
-to speak), then prints `recorded <path> (N.Ns)`; `play`/`play-last` print
+`record` first speaks a short cue ("I'll start recording after the beep, for N
+seconds"), plays a beep, then captures — the recording begins cleanly *after*
+the beep. It then prints `recorded <path> (N.Ns)`; `play`/`play-last` print
 `played <path>` once playback finishes (the command blocks until it's done).
 With no seconds, `record` waits for you to start speaking and stops after ~1.5s
 of silence. Recordings are saved under `~/.local/share/iva-voice/recordings/`. Tell

@@ -21,12 +21,19 @@ Usage:
   iva-audio play FILE                 # play a WAV/mp3 out the speaker
   iva-audio play-last                 # replay the most recent recording
 
-Env knobs (shared names with the daemon):
-  WAKE_CH (0=FL,1=FR), SPEECH_MULT, SPEECH_MIN, IVA_REC_MAX (max record seconds).
-"""
-import os, sys, time, glob, subprocess
+Before capturing, `record` speaks a short cue ("I'll start recording after the
+beep, for N seconds"), plays a beep, then begins — the captured audio starts
+cleanly AFTER the beep (the stream warm-up is drained).
 
+Env knobs (shared names with the daemon):
+  WAKE_CH (0=FL,1=FR), SPEECH_MULT, SPEECH_MIN, IVA_REC_MAX (max record seconds),
+  IVA_REC_ANNOUNCE=0 to skip the spoken cue (beep still plays).
+"""
+import os, sys, time, glob, json, subprocess
+
+HERMES = "/home/iva/.hermes/hermes-agent"      # for the shared TTS tool (announce)
 os.environ.setdefault("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+os.environ.setdefault("OPENAI_API_KEY", "sk-local")   # local backends ignore it; client requires it
 import numpy as np
 import sounddevice as sd
 import soundfile as sf
@@ -85,6 +92,45 @@ def _beep(freq=880.0, dur=0.15, vol=0.3):
         pass
 
 
+def announce(text):
+    """Speak a short cue BEFORE the beep, via the daemon's TTS path. Best-effort:
+    if TTS/backend is unavailable we just skip it — recording must never depend
+    on it. Disable entirely with IVA_REC_ANNOUNCE=0."""
+    if os.environ.get("IVA_REC_ANNOUNCE", "1") != "1":
+        return
+    cwd = os.getcwd()
+    try:
+        if HERMES not in sys.path:
+            sys.path.insert(0, HERMES)
+        os.chdir(HERMES)                         # tts_tool/load_config expect this
+        from tools.tts_tool import text_to_speech_tool
+        r = json.loads(text_to_speech_tool(text=text))
+        if not r.get("success"):
+            return
+        mp3 = r["file_path"]
+        wav = mp3.rsplit(".", 1)[0] + ".cue.wav"
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", mp3,
+                        "-ar", "24000", "-ac", "1", wav], check=False)
+        if os.path.isfile(wav):
+            data, sr = sf.read(wav, dtype="int16")
+            sd.play(data, sr); sd.wait()
+    except Exception as e:
+        print(f"[announce] skipped ({type(e).__name__})", flush=True)
+    finally:
+        os.chdir(cwd)
+
+
+def _open_drained(drain_s=0.35):
+    """Open the input and discard the first ~drain_s of audio, so the tail of the
+    start beep / stream warm-up never bleeds into the recording. (This is why the
+    captured audio cleanly begins AFTER the beep, not during it.)"""
+    s, ch = open_input()
+    t = time.monotonic()
+    while (time.monotonic() - t) < drain_s:
+        read_fl(s, ch)
+    return s, ch
+
+
 def _default_outfile():
     os.makedirs(REC_DIR, exist_ok=True)
     return os.path.join(REC_DIR, f"rec_{int(time.time())}.wav")
@@ -93,8 +139,9 @@ def _default_outfile():
 def record_fixed(seconds, outfile):
     seconds = min(seconds, REC_MAX)
     print(f"starting recording ({seconds:.0f}s)...", flush=True)
+    announce(f"I'll start recording after the beep, for {int(round(seconds))} seconds.")
     _beep()
-    s, ch = open_input()
+    s, ch = _open_drained()          # beep finished; discard warm-up, then capture
     frames = []
     t0 = time.monotonic()
     try:
@@ -118,10 +165,11 @@ def record_until_silence(outfile, silence_s=1.5, start_timeout_s=8.0):
     """Sample ambient briefly to set a threshold, then capture until ~silence_s
     of quiet after speech. Mirrors the daemon's record_to_silence gating."""
     print("starting recording (speak now)...", flush=True)
+    announce("I'll start recording after the beep. Go ahead when you're ready.")
     _beep()
     s, ch = open_input()
     frames = []
-    # ~0.4s ambient sampling to estimate the noise floor for this room
+    # ~0.4s ambient sampling (also drains the beep tail; not added to frames)
     ambient = []
     t_amb = time.monotonic()
     while (time.monotonic() - t_amb) < 0.4:
@@ -198,7 +246,7 @@ def main(argv):
                 seconds = float(a)
             except ValueError:
                 outfile = a
-        outfile = os.path.expanduser(outfile) if outfile else _default_outfile()
+        outfile = os.path.abspath(os.path.expanduser(outfile)) if outfile else _default_outfile()
         os.makedirs(os.path.dirname(outfile), exist_ok=True)
         if seconds is not None:
             record_fixed(seconds, outfile)
