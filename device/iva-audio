@@ -1,0 +1,218 @@
+#!/home/iva/.hermes/hermes-agent/venv/bin/python
+"""iva-audio — record from the mic and play audio out the speaker, the SAME way
+the voice daemon does it (so it actually works on this hardware).
+
+Why a standalone helper (not raw arecord/aplay, not code in the daemon):
+  * The XVF3800 exposes a 6-channel capture (FL FR FC LFE RL RR). A plain mono
+    capture DOWNMIXES all 6 and dilutes the voice ~5x. We open 6ch and extract
+    the FL channel (WAKE_CH=0), exactly like hermes_voice_wake.py.
+  * Playing goes through sounddevice/sd.play to the default sink (the proven
+    path the daemon uses for replies); ffplay can pick the wrong device.
+  * This is a SEPARATE process from the daemon, so it has its own PortAudio
+    instance — it does not hit the in-process PortAudio re-entrancy that made
+    the daemon segfault. Skills run mid-turn while the daemon's stream is closed.
+
+Usage:
+  iva-audio record [SECONDS] [FILE]   # record from the mic to a WAV
+                                      #   SECONDS given  -> fixed-length capture
+                                      #   SECONDS absent -> record until silence
+                                      #   FILE absent    -> auto path under
+                                      #     ~/.local/share/iva-voice/recordings/
+  iva-audio play FILE                 # play a WAV/mp3 out the speaker
+  iva-audio play-last                 # replay the most recent recording
+
+Env knobs (shared names with the daemon):
+  WAKE_CH (0=FL,1=FR), SPEECH_MULT, SPEECH_MIN, IVA_REC_MAX (max record seconds).
+"""
+import os, sys, time, glob, subprocess
+
+os.environ.setdefault("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+import numpy as np
+import sounddevice as sd
+import soundfile as sf
+
+RATE = 16000
+BLOCK = 1280
+WAKE_CH = int(os.environ.get("WAKE_CH", "0"))      # 0=FL, 1=FR
+SPEECH_MULT = float(os.environ.get("SPEECH_MULT", "3.0"))
+SPEECH_MIN = float(os.environ.get("SPEECH_MIN", "450"))
+REC_MAX = float(os.environ.get("IVA_REC_MAX", "60"))   # hard cap on any recording
+REC_DIR = os.path.expanduser("~/.local/share/iva-voice/recordings")
+
+
+def die(msg, code=1):
+    print(msg, file=sys.stderr)
+    sys.exit(code)
+
+
+def open_input():
+    """Open input; prefer 6ch (to extract FL), fall back to mono — like the daemon."""
+    for ch in (6, 1):
+        try:
+            s = sd.RawInputStream(samplerate=RATE, channels=ch, dtype="int16", blocksize=BLOCK)
+            s.start()
+            return s, ch
+        except Exception:
+            continue
+    die("no input stream (mic unavailable)")
+
+
+def read_fl(stream, ch):
+    data, _ = stream.read(BLOCK)
+    if ch == 1:
+        return bytes(data)
+    arr = np.frombuffer(bytes(data), np.int16).reshape(-1, ch)
+    return np.ascontiguousarray(arr[:, min(WAKE_CH, ch - 1)]).tobytes()
+
+
+def _rms(a):
+    return float(np.sqrt(np.mean(a.astype(np.float32) ** 2))) if a.size else 0.0
+
+
+def _beep(freq=880.0, dur=0.15, vol=0.3):
+    """Short tone to signal 'recording started' (same idea as the wake beep).
+    Plays output and blocks until done BEFORE the input stream opens, so it
+    isn't captured in the recording (and avoids input->input re-entrancy)."""
+    t = np.linspace(0, dur, int(RATE * dur), endpoint=False)
+    x = (np.sin(2 * np.pi * freq * t).astype(np.float32) * vol)
+    f = int(RATE * 0.008)                       # 8ms fade in/out to avoid clicks
+    if x.size > 2 * f:
+        x[:f] *= np.linspace(0, 1, f)
+        x[-f:] *= np.linspace(1, 0, f)
+    try:
+        sd.play(x, RATE); sd.wait()
+    except Exception:
+        pass
+
+
+def _default_outfile():
+    os.makedirs(REC_DIR, exist_ok=True)
+    return os.path.join(REC_DIR, f"rec_{int(time.time())}.wav")
+
+
+def record_fixed(seconds, outfile):
+    seconds = min(seconds, REC_MAX)
+    print(f"starting recording ({seconds:.0f}s)...", flush=True)
+    _beep()
+    s, ch = open_input()
+    frames = []
+    t0 = time.monotonic()
+    try:
+        while (time.monotonic() - t0) < seconds:
+            a = np.frombuffer(read_fl(s, ch), np.int16)
+            if a.size:
+                frames.append(a.copy())
+    finally:
+        try:
+            s.stop(); s.close()
+        except Exception:
+            pass
+    if not frames:
+        die("recorded nothing (no audio captured)")
+    sf.write(outfile, np.concatenate(frames), RATE, subtype="PCM_16")
+    dur = len(np.concatenate(frames)) / RATE
+    print(f"recorded {outfile} ({dur:.1f}s)")
+
+
+def record_until_silence(outfile, silence_s=1.5, start_timeout_s=8.0):
+    """Sample ambient briefly to set a threshold, then capture until ~silence_s
+    of quiet after speech. Mirrors the daemon's record_to_silence gating."""
+    print("starting recording (speak now)...", flush=True)
+    _beep()
+    s, ch = open_input()
+    frames = []
+    # ~0.4s ambient sampling to estimate the noise floor for this room
+    ambient = []
+    t_amb = time.monotonic()
+    while (time.monotonic() - t_amb) < 0.4:
+        a = np.frombuffer(read_fl(s, ch), np.int16)
+        if a.size:
+            ambient.append(_rms(a))
+    floor = np.median(ambient) if ambient else SPEECH_MIN
+    thresh = max(SPEECH_MIN, floor * SPEECH_MULT)
+    speech = False
+    t0 = time.monotonic()
+    last = t0
+    try:
+        while True:
+            a = np.frombuffer(read_fl(s, ch), np.int16)
+            if a.size:
+                frames.append(a.copy())
+            now = time.monotonic()
+            if _rms(a) >= thresh:
+                speech = True
+                last = now
+            if speech and (now - last) >= silence_s:
+                break
+            if (not speech) and (now - t0) >= start_timeout_s:
+                die("no speech detected (timed out waiting to start)")
+            if (now - t0) >= REC_MAX:
+                break
+    finally:
+        try:
+            s.stop(); s.close()
+        except Exception:
+            pass
+    if not speech or not frames:
+        die("recorded nothing (no speech)")
+    sf.write(outfile, np.concatenate(frames), RATE, subtype="PCM_16")
+    dur = len(np.concatenate(frames)) / RATE
+    print(f"recorded {outfile} ({dur:.1f}s)")
+
+
+def play(path):
+    path = os.path.expanduser(path)
+    if not os.path.isfile(path):
+        die(f"no such file: {path}")
+    wav = path
+    if not path.lower().endswith(".wav"):
+        # convert anything else (mp3, m4a, ...) to wav, like the daemon does for TTS
+        wav = path.rsplit(".", 1)[0] + ".play.wav"
+        subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", path,
+                        "-ar", "24000", "-ac", "1", wav], check=False)
+        if not os.path.isfile(wav):
+            die("could not decode audio (ffmpeg failed)")
+    data, sr = sf.read(wav, dtype="int16")
+    sd.play(data, sr)
+    sd.wait()
+    print(f"played {path}")
+
+
+def play_last():
+    files = sorted(glob.glob(os.path.join(REC_DIR, "*.wav")), key=os.path.getmtime)
+    if not files:
+        die("no recordings yet")
+    play(files[-1])
+
+
+def main(argv):
+    if not argv:
+        die(__doc__)
+    cmd = argv[0]
+    rest = argv[1:]
+    if cmd == "record":
+        seconds = None
+        outfile = None
+        for a in rest:
+            try:
+                seconds = float(a)
+            except ValueError:
+                outfile = a
+        outfile = os.path.expanduser(outfile) if outfile else _default_outfile()
+        os.makedirs(os.path.dirname(outfile), exist_ok=True)
+        if seconds is not None:
+            record_fixed(seconds, outfile)
+        else:
+            record_until_silence(outfile)
+    elif cmd == "play":
+        if not rest:
+            die("usage: iva-audio play FILE")
+        play(rest[0])
+    elif cmd == "play-last":
+        play_last()
+    else:
+        die(f"unknown command: {cmd}\n{__doc__}")
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

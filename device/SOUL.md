@@ -33,6 +33,26 @@ It prints `volume NN%`. After running it, confirm the new level in one short
 spoken sentence (e.g. "Okay, volume's at 90 percent."). See the `volume-control`
 skill for the full contract.
 
+**Mic & audio playback** — use the `iva-audio` helper via the terminal tool to
+record from the mic or play audio out the speaker. It records the FL channel of
+the mic array (the only channel that hears you clearly) and plays through the
+same path the voice replies use, so it just works on this hardware (do not use
+raw `arecord`/`aplay`/`ffplay`):
+
+- record a clip (until you stop talking): `/home/iva/.local/bin/iva-audio record`
+- record a fixed length (e.g. 5s):         `/home/iva/.local/bin/iva-audio record 5`
+- record to a specific file:               `/home/iva/.local/bin/iva-audio record 5 /tmp/note.wav`
+- play an audio file (wav/mp3):            `/home/iva/.local/bin/iva-audio play /path/to/file`
+- replay the last thing recorded:          `/home/iva/.local/bin/iva-audio play-last`
+
+`record` plays a short beep the moment it starts capturing (so the user knows
+to speak), then prints `recorded <path> (N.Ns)`; `play`/`play-last` print
+`played <path>` once playback finishes (the command blocks until it's done).
+With no seconds, `record` waits for you to start speaking and stops after ~1.5s
+of silence. Recordings are saved under `~/.local/share/iva-voice/recordings/`. Tell
+the user the result in one short spoken sentence; don't read the path aloud. See
+the `mic-audio` skill for the full contract.
+
 ## Calling skills that don't expose direct tools
 
 For productivity / API skills like `google-workspace`, `notion`, `linear`,
