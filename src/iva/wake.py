@@ -231,15 +231,43 @@ def _warmup_llm():
         print(f"[warmup] attempt failed (non-fatal): {e}", flush=True)
         return False
 
-# Warm up on every start/restart BEFORE serving, so the first turn has no
-# cold-start delay. IVA_WARMUP=sync (default, blocks until primed; retries while
-# the backend is still coming up) | async (background, old behaviour) | off.
+def _wait_for_backend(timeout=None):
+    """Wait until the LLM backend (model.base_url) answers. On a Pi boot this
+    service auto-starts before the network / the backend host is up, so block
+    here (up to IVA_BACKEND_WAIT seconds, default 180) until it's reachable —
+    any HTTP response counts. Returns True if reachable."""
+    if timeout is None:
+        timeout = float(os.environ.get("IVA_BACKEND_WAIT", "180"))
+    base = (m.get("base_url") or "").rstrip("/")
+    if not base:
+        return False
+    import urllib.request, urllib.error
+    url = base + "/models"
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < timeout:
+        try:
+            urllib.request.urlopen(url, timeout=4)
+            print(f"[wait] backend reachable after {time.monotonic()-t0:.0f}s", flush=True)
+            return True
+        except urllib.error.HTTPError:       # 4xx/5xx = server is up
+            print(f"[wait] backend reachable after {time.monotonic()-t0:.0f}s", flush=True)
+            return True
+        except Exception as e:               # connection refused / DNS / timeout
+            print(f"[wait] backend not ready ({type(e).__name__}); retrying...", flush=True)
+            time.sleep(4)
+    print(f"[wait] backend still unreachable after {timeout:.0f}s; starting anyway", flush=True)
+    return False
+
+# Wait for the backend, then warm up, BEFORE serving — so a Pi cold-boot waits
+# for the network/backend and the first turn has no cold-start delay.
+# IVA_WARMUP=sync (default) | async (background) | off.
 _WARMUP = (os.environ.get("IVA_WARMUP") or "sync").strip().lower()
 if _WARMUP == "off":
     print("[warmup] disabled (IVA_WARMUP=off)", flush=True)
 elif _WARMUP == "async":
-    threading.Thread(target=_warmup_llm, daemon=True).start()
+    threading.Thread(target=lambda: (_wait_for_backend(), _warmup_llm()), daemon=True).start()
 else:
+    _wait_for_backend()
     _retries = int(os.environ.get("IVA_WARMUP_RETRIES", "6"))
     print("[warmup] priming before serving (IVA_WARMUP=sync)...", flush=True)
     for _i in range(max(1, _retries)):
