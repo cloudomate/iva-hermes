@@ -28,7 +28,21 @@ This repo is a **Python package** (`iva`, src layout):
   `ensure-xvf-profile.sh`, and `install-device.sh` (pip-installs the package
   into the Hermes venv, symlinks the entry points to `~/.local/bin`, installs
   the unit + wake-word models).
-- `pyproject.toml` — packaging (hatchling); entry points `iva-audio`, `iva-volume`.
+- `src/iva/ble/` — the **companion-app setup service** (`iva-ble`, systemd unit
+  `iva-ble.service`): a bless GATT peripheral ("Iva Setup") speaking JSON-RPC —
+  `rpc.py` (transport-agnostic dispatch + password/token auth in `auth.py`),
+  `handlers.py` (status/wifi/models/wakeword/audio/volume/bluetooth/apply).
+  The Flutter app `cloudomate/iva-app` is the BLE central; UUIDs must stay in
+  sync with its `lib/ble/protocol.dart`.
+- `src/iva/api/` — the **web-console service** (`iva-api`, `iva-api.service`,
+  port **8800**): FastAPI second transport over the SAME rpc/auth/handlers —
+  `POST /rpc`, `WS /chat` (streaming text turns through the same AIAgent setup
+  + history file as the voice daemon: one conversation across voice and web),
+  extra shared actions `chat.history` + `skills.*` (`actions.py`), and statically
+  serves the SPA from `cloudomate/iva-web` (`~/.local/share/iva-web`). Tokens
+  are per-process: a BLE login is not valid on the API and vice versa.
+- `pyproject.toml` — packaging (hatchling); entry points `iva-audio`, `iva-volume`,
+  `iva-ble`, `iva-api`; extras `ble` (bless) and `api` (fastapi, uvicorn).
 - `install.sh` — separate concern: pulls the agent skills (cloudomate/skills)
   onto a device and registers them in `config.yaml` (`skills.external_dirs`).
 
