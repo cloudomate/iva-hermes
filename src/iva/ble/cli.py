@@ -15,6 +15,10 @@ def main(argv=None):
 
     if cmd == "serve":
         import asyncio
+        try:  # share the web-console's extra actions (chat.history, skills.*)
+            from iva.api import actions  # noqa: F401 — extends the REGISTRY
+        except ImportError:
+            pass
         from .server import serve
         try:
             asyncio.run(serve())
