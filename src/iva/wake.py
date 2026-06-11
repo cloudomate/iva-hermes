@@ -126,10 +126,16 @@ def _set_cutoff(m):
     except Exception: pass
     return m
 def load_wake_models():
+    # WAKE_ACTIVE (a single model basename) pins loading to that one; unset = load
+    # every *.json in the dir (original behavior).
+    active = os.environ.get("WAKE_ACTIVE", "").strip()
     out=[]
     for cfg in sorted(glob.glob(os.path.join(WAKE_MODELS_DIR, "*.json"))):
+        name = os.path.splitext(os.path.basename(cfg))[0]
+        if active and name != active:
+            continue
         try:
-            out.append((os.path.splitext(os.path.basename(cfg))[0], _set_cutoff(MicroWakeWord.from_config(cfg))))
+            out.append((name, _set_cutoff(MicroWakeWord.from_config(cfg))))
             print(f"[init] loaded custom wake model: {cfg}", flush=True)
         except Exception as e:
             print(f"[init] FAILED to load {cfg}: {e}", flush=True)
@@ -581,7 +587,7 @@ def do_turn(start_timeout_s=8):
     # answer/escalate route. Falls back to plain STT when PA is off or fails.
     pa_route, pa_intent, pa_reply = "escalate", "continue", ""
     if _PA:
-        pa = personal_assistant(wav, cfg)
+        pa = personal_assistant(wav, cfg, history=history)
         text = (pa.get("transcript") or "").strip()
         pa_route = pa.get("route") or "escalate"
         pa_intent = pa.get("intent") or "continue"

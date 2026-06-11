@@ -9,6 +9,7 @@
   iva audio  <args>       record / play audio         (alias of iva-audio)
   iva display             optional rich state UI
   iva install             optional: systemd --user unit to autostart `iva run` on boot
+  iva ble <args>          companion-app setup service over BLE (serve|exec|install)
 
 Greenfield:  pip install iva-hermes  &&  iva run
 """
@@ -80,11 +81,17 @@ def _install(rest):
     install(rest)
 
 
+def _ble(rest):
+    from iva.ble.cli import main as ble_main
+    return ble_main(rest)
+
+
 _COMMANDS = {
     "run": _run,
     "doctor": _doctor,
     "config": _config,
     "install": _install,
+    "ble": _ble,
     "presets": _presets,
     "display": _display,
     "volume": _volume,

@@ -35,6 +35,7 @@ dependencies = [
 
 [project.optional-dependencies]
 display = ["rich"]            # optional state UI (iva display)
+ble = ["bless"]               # companion-app setup service (BLE GATT peripheral)
 
 [project.scripts]
 # One umbrella CLI plus name-compatible aliases (SOUL.md / skills call the
@@ -42,6 +43,7 @@ display = ["rich"]            # optional state UI (iva display)
 iva = "iva.cli:main"
 iva-audio = "iva.audio:main"
 iva-volume = "iva.volume:main"
+iva-ble = "iva.ble.cli:main"
 
 [project.urls]
 Homepage = "https://github.com/cloudomate/iva-hermes"
