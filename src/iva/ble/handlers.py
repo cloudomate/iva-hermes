@@ -193,16 +193,43 @@ def h_wifi_scan(_p):
     return {"networks": sorted(nets.values(), key=lambda n: -n["signal"])}
 
 
+def _profiles_for_ssid(ssid):
+    """Saved NetworkManager profiles whose 802-11-wireless.ssid matches."""
+    _, out, _ = _run(["nmcli", "-t", "-f", "NAME,TYPE", "connection", "show"])
+    names = [l.split(":", 1)[0] for l in out.splitlines()
+             if l.endswith(":802-11-wireless")]
+    matches = []
+    for name in names:
+        _, s, _ = _run(["nmcli", "-t", "-f", "802-11-wireless.ssid",
+                        "connection", "show", name])
+        if s.strip().split(":", 1)[-1] == ssid:
+            matches.append(name)
+    return matches
+
+
 def h_wifi_connect(p):
     ssid = (p.get("ssid") or "").strip()
+    password = p.get("password")
     if not ssid:
         raise CmdError("ssid required")
+    # Already on this network → no-op (also avoids nmcli touching the live link).
+    if h_wifi_status({}).get("ssid") == ssid:
+        return h_wifi_status({})
+    # A fresh password should win over any saved profile for this SSID. Stale
+    # profiles (e.g. netplan-generated ones without a security section) make
+    # `nmcli dev wifi connect` fail with "key-mgmt: property is missing".
+    if password:
+        for name in _profiles_for_ssid(ssid):
+            _run(["nmcli", "connection", "delete", name], timeout=15)
     cmd = ["nmcli", "dev", "wifi", "connect", ssid]
-    if p.get("password"):
-        cmd += ["password", p["password"]]
+    if password:
+        cmd += ["password", password]
     rc, out, err = _run(cmd, timeout=45)
     if rc != 0:
-        raise CmdError((err or out).strip()[:200] or "connect failed")
+        msg = (err or out).strip()
+        if "key-mgmt" in msg or "Secrets were required" in msg or "802-11-wireless-security" in msg:
+            raise CmdError(f"'{ssid}' needs a Wi-Fi password — enter it and try again")
+        raise CmdError(msg[:200] or "connect failed")
     return h_wifi_status({})
 
 
