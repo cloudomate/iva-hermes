@@ -9,6 +9,11 @@
   iva audio  <args>       record / play audio         (alias of iva-audio)
   iva display             optional rich state UI
   iva install             optional: systemd --user unit to autostart `iva run` on boot
+  iva ble <args>          companion-app setup service over BLE (serve|exec|install)
+  iva reset [--yes]       factory-style reset: wipe pairing/app settings/history/logs,
+                          restart services, re-open BLE onboarding (keeps ~/.hermes)
+  iva reset-button        standalone GPIO reset-button listener (--pin/--hold);
+                          normally armed inside iva-ble via IVA_RESET_GPIO
 
 Greenfield:  pip install iva-hermes  &&  iva run
 """
@@ -80,11 +85,39 @@ def _install(rest):
     install(rest)
 
 
+def _ble(rest):
+    from iva.ble.cli import main as ble_main
+    return ble_main(rest)
+
+
+def _reset(rest):
+    from iva.reset import reset
+    if "--yes" not in rest:
+        ans = input("Factory reset? Wipes password/paired devices, app settings, "
+                    "history and logs (keeps ~/.hermes backend config) [y/N] ")
+        if ans.strip().lower() not in ("y", "yes"):
+            print("aborted")
+            return 1
+    out = reset(restart=True)
+    for p in out["removed"]:
+        print("removed:", p)
+    print("restarting:", ", ".join(out["restarting"]))
+    print("BLE onboarding broadcast will be back once iva-ble restarts.")
+
+
+def _reset_button(rest):
+    from iva.reset_button import main as rb_main
+    return rb_main(rest)
+
+
 _COMMANDS = {
     "run": _run,
     "doctor": _doctor,
     "config": _config,
     "install": _install,
+    "ble": _ble,
+    "reset": _reset,
+    "reset-button": _reset_button,
     "presets": _presets,
     "display": _display,
     "volume": _volume,

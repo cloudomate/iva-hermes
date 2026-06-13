@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Headless wake-word voice assistant for Hermes (iva).
-Wake (microWakeWord, FL) -> record -> whisper -> agent -> Kokoro TTS -> play.
+Wake (microWakeWord, FL) -> record -> 12B audio router (ONE no-tools call:
+ASR + answer directly | escalate with an instant "Ok, let me ... for you."
+ack; Whisper is the fallback STT) -> agent with tools (escalate only, text)
+-> Kokoro TTS -> play.
 After speaking, the LLM's reply directive ([[stay]] / [[sleep]]) decides the next
 state: stay opens the mic again with no wake gate (with a 12s idle dropback);
 sleep returns to wake-only. Barge-in: user speech during TTS cuts playback and
@@ -126,10 +129,16 @@ def _set_cutoff(m):
     except Exception: pass
     return m
 def load_wake_models():
+    # WAKE_ACTIVE (a single model basename) pins loading to that one; unset = load
+    # every *.json in the dir (original behavior).
+    active = os.environ.get("WAKE_ACTIVE", "").strip()
     out=[]
     for cfg in sorted(glob.glob(os.path.join(WAKE_MODELS_DIR, "*.json"))):
+        name = os.path.splitext(os.path.basename(cfg))[0]
+        if active and name != active:
+            continue
         try:
-            out.append((os.path.splitext(os.path.basename(cfg))[0], _set_cutoff(MicroWakeWord.from_config(cfg))))
+            out.append((name, _set_cutoff(MicroWakeWord.from_config(cfg))))
             print(f"[init] loaded custom wake model: {cfg}", flush=True)
         except Exception as e:
             print(f"[init] FAILED to load {cfg}: {e}", flush=True)
@@ -149,7 +158,7 @@ from run_agent import AIAgent
 from tools.voice_mode import create_audio_recorder, play_audio_file, is_whisper_hallucination
 from tools.transcription_tools import transcribe_audio
 from tools.tts_tool import text_to_speech_tool
-from iva.personal_assistant import personal_assistant, is_enabled as _pa_enabled
+from iva.router import route_turn, is_enabled as _router_enabled
 
 cfg=load_config(); m=cfg.get("model",{}); _state["model"]=m.get("default","")
 print(f"[init] agent model={m.get('default')} base_url={m.get('base_url')}",flush=True)
@@ -208,11 +217,14 @@ agent=AIAgent(model=m.get("default"),base_url=m.get("base_url"),api_key=m.get("a
     provider=m.get("provider","custom"),quiet_mode=True,skip_memory=False,
     session_id="iva-voice-main", platform="cli", load_soul_identity=True,
     request_overrides=_REQ_OVERRIDES)
-# Tier-1 "personal assistant" (E4B audio router). When ON, the recorded audio
-# goes to the PA first (ASR + continue/drop intent + answer/escalate route);
-# the 12B above is only invoked on escalate. Endpoint from cfg["personal_assistant"].
-_PA = _pa_enabled()
-print(f"[init] personal-assistant tier (E4B router) {'ON' if _PA else 'OFF'} (set IVA_PA=1 to enable)", flush=True)
+# Tier-1 router (replaces the E4B audio PA): each recorded turn goes straight
+# to the SAME 12B (audio-in via its unified-arch mmproj) with a tiny no-tools
+# prompt — ONE call does ASR + answer-vs-escalate + the spoken reply/ack; the
+# tool-equipped agent call runs only on escalate. The two prompt shapes land in
+# different llama.cpp slots, so both prefixes stay KV-cached. See iva/router.py.
+# IVA_ROUTER=0 disables (Whisper + single-call agent).
+_ROUTER = _router_enabled()
+print(f"[init] 12B two-call router {'ON' if _ROUTER else 'OFF (single-call agent)'} (IVA_ROUTER=0 to disable)", flush=True)
 HISTORY_FILE="/home/iva/.hermes-voice-history.json"
 try:
     history=json.load(open(HISTORY_FILE)); print(f"[init] loaded {len(history)} history msgs from disk",flush=True)
@@ -236,6 +248,19 @@ def _warmup_llm():
     except Exception as e:
         print(f"[warmup] attempt failed (non-fatal): {e}", flush=True)
         return False
+
+def _warmup_router():
+    """Prime the router prefix too — it is a different prompt shape, so it
+    lands in (and stays cached in) a different llama.cpp slot than the
+    with-tools agent prefix primed by _warmup_llm()."""
+    if not _ROUTER:
+        return
+    try:
+        t0 = time.monotonic()
+        route_turn(text="warm up — reply with just ok", history=history, cfg=cfg)
+        print(f"[warmup] router primed in {time.monotonic()-t0:.1f}s", flush=True)
+    except Exception as e:
+        print(f"[warmup] router attempt failed (non-fatal): {e}", flush=True)
 
 def _wait_for_backend(timeout=None):
     """Wait until the LLM backend (model.base_url) answers. On a Pi boot this
@@ -271,7 +296,7 @@ _WARMUP = (os.environ.get("IVA_WARMUP") or "sync").strip().lower()
 if _WARMUP == "off":
     print("[warmup] disabled (IVA_WARMUP=off)", flush=True)
 elif _WARMUP == "async":
-    threading.Thread(target=lambda: (_wait_for_backend(), _warmup_llm()), daemon=True).start()
+    threading.Thread(target=lambda: (_wait_for_backend(), _warmup_llm(), _warmup_router()), daemon=True).start()
 else:
     _wait_for_backend()
     _retries = int(os.environ.get("IVA_WARMUP_RETRIES", "6"))
@@ -280,6 +305,7 @@ else:
         if _warmup_llm():
             break
         time.sleep(3)   # backend may still be starting
+    _warmup_router()
 
 def open_input():
     """Open the capture stream. AUDIO_CHANNELS pins the channel count (e.g. 6 for
@@ -577,32 +603,32 @@ def do_turn(start_timeout_s=8):
             print(f"[gate] error, falling through: {_e}", flush=True)
     t_stt0 = time.monotonic()
     publish("transcribing")
-    # Tier-1 personal assistant: one E4B call does ASR + continue/drop intent +
-    # answer/escalate route. Falls back to plain STT when PA is off or fails.
-    pa_route, pa_intent, pa_reply = "escalate", "continue", ""
-    if _PA:
-        pa = personal_assistant(wav, cfg)
-        text = (pa.get("transcript") or "").strip()
-        pa_route = pa.get("route") or "escalate"
-        pa_intent = pa.get("intent") or "continue"
-        pa_reply = (pa.get("reply") or "").strip()
-        print(f"[t] rec={t_stt0-t_rec0:.2f}s pa={pa.get('latency')}s route={pa_route} "
-              f"intent={pa_intent} text={text!r}" + (f" err={pa['error']}" if pa.get('error') else ""), flush=True)
-        if not text:
-            # PA didn't hear it — use the existing STT so the 12B still gets text.
-            r = transcribe_audio(wav); text = (r.get("transcript") or "").strip()
-            pa_route = "escalate"
-            print(f"[pa] empty transcript -> STT fallback text={text!r}", flush=True)
-    else:
+    # Tier-1 router (call 1, no tools): ONE audio-in 12B call does ASR +
+    # answer/escalate route + continue/drop intent + the spoken reply/ack.
+    # Whisper remains the STT fallback when the router is off, errors, or
+    # didn't hear anything (RELIABILITY CONTRACT in iva/router.py).
+    rt_route, rt_intent, rt_reply, text = "escalate", "continue", "", ""
+    if _ROUTER:
+        rt = route_turn(wav=wav, history=history, cfg=cfg)
+        text = (rt.get("transcript") or "").strip()
+        rt_route = rt.get("route") or "escalate"
+        rt_intent = rt.get("intent") or "continue"
+        rt_reply = (rt.get("reply") or "").strip()
+        print(f"[router] rec={t_stt0-t_rec0:.2f}s t={rt.get('latency')}s route={rt_route} "
+              f"intent={rt_intent} heard={text!r} reply={rt_reply[:60]!r}"
+              + (f" err={rt['error']}" if rt.get('error') else ""), flush=True)
+    if not text:
+        # Router off or didn't hear it — classic Whisper path, full agent.
+        rt_route, rt_intent, rt_reply = "escalate", "continue", ""
         r = transcribe_audio(wav); text=(r.get("transcript") or "").strip()
-        print(f"[t] rec={t_stt0-t_rec0:.2f}s stt={time.monotonic()-t_stt0:.2f}s text={text!r} wav={wav}", flush=True)
-    if pa_intent == "drop" or is_close_intent(text):
-        # User closed (PA drop, or close-intent regex / hallucinated close-phrase).
-        # Skip the LLM; the sleep beep in the main loop's finally is the ack.
+        print(f"[t] stt={time.monotonic()-t_stt0:.2f}s text={text!r} wav={wav}", flush=True)
+        if not text or is_whisper_hallucination(text):
+            print(f"[turn] no usable speech ({text!r})",flush=True); return "sleep"
+    if rt_intent == "drop" or is_close_intent(text):
+        # User closed (router drop, close-intent regex / hallucinated close-phrase).
+        # Skip the agent; the sleep beep in the main loop's finally is the ack.
         print(f"[turn] drop/close ({text!r}) -> sleep", flush=True)
         return "sleep"
-    if not text or (not _PA and is_whisper_hallucination(text)):
-        print(f"[turn] no usable speech ({text!r})",flush=True); return "sleep"
     publish("thinking", user=text)
     # Clear any stale interrupt flag from a previous turn — otherwise the
     # LLM call would abort instantly on a barge-in we already serviced.
@@ -684,23 +710,32 @@ def do_turn(start_timeout_s=8):
     t_start = time.monotonic()
     mon.start(); synth.start()
 
-    # Tier-1 answers simple turns directly — speak the PA reply, skip the 12B,
-    # and return early (the streaming/flush logic below is 12B-only).
-    if _PA and pa_route == "answer":
-        if pa_reply: text_q.put(pa_reply)
-        text_q.put(None); synth.join(); stop_mon.set(); mon.join(timeout=0.5)
+    # Call 1 answered directly — speak it, persist the turn into the shared
+    # history (voice + web console read the same file), skip the with-tools
+    # agent call, and return early (the streaming/flush logic below is for
+    # the agent path only).
+    if _ROUTER and rt_route == "answer" and rt_reply:
+        publish("speaking", user=text, reply=rt_reply[:60])
+        text_q.put(rt_reply); text_q.put(None)
+        synth.join(); stop_mon.set(); mon.join(timeout=0.5)
         _state["turns"] += 1
-        directive = "stay" if pa_intent == "continue" else "sleep"
-        print(f"[pa] answered directly -> {directive} ({time.monotonic()-t_start:.2f}s)", flush=True)
+        history.append({"role": "user", "content": text})
+        history.append({"role": "assistant", "content": rt_reply})
+        history = history[-int(os.environ.get("IVA_HISTORY_CAP", "20")):]
+        _persist_history()
+        directive = "stay" if rt_intent == "continue" else "sleep"
+        print(f"[router] answered directly -> {directive} ({time.monotonic()-t_start:.2f}s)", flush=True)
         last_activity[0] = time.time()
         if interrupted.is_set() and directive != "sleep": return "stay"
         return directive
 
     reply = ""
     try:
-        # Escalate: speak the PA's instant ack first (plays while the 12B prefills).
-        if _PA and pa_reply:
-            text_q.put(pa_reply); content_enqueued[0] = True
+        # Escalate (call 2, with tools): speak the router's instant ack first —
+        # it plays while the agent call prefills. content_enqueued=True makes
+        # the narration filter drop the agent's own "Sure, let me..." opener.
+        if _ROUTER and rt_reply:
+            text_q.put(rt_reply); content_enqueued[0] = True
         result = agent.run_conversation(
             VOICE_HINT + text,
             conversation_history=history,
@@ -722,30 +757,27 @@ def do_turn(start_timeout_s=8):
     final_buf = buf[0] if len(buf[0]) >= len(reply) else reply
     clean_full, last_in_buf = strip_directives(final_buf)
     clean_full = (clean_full or "").strip()
-    if _PA:
-        # Tier-1 owns continue/drop; the 12B's own [[stay]]/[[sleep]] is ignored
-        # (still stripped from the spoken text by stream_cb).
-        directive = "stay" if pa_intent == "continue" else "sleep"
-        _had_directive = True
-        print(f"[dir] {directive!r} (PA intent={pa_intent})", flush=True)
-    else:
-        # Prefer what we caught during streaming; fall back to a final scan; then
-        # to the "stay" default (matches SOUL.md and the conversational expectation).
-        directive = seen_dir[0] or last_in_buf or "stay"
-        _had_directive = bool(seen_dir[0] or last_in_buf)
-        # If the assistant actually said goodbye, override to sleep — model often
-        # drifts and emits the wrong directive (or none) on close turns.
-        if directive == "stay" and assistant_signals_close(clean_full):
-            print(f"[dir] override stay->sleep (assistant said goodbye)", flush=True)
-            directive = "sleep"
-        # If the reply was 100% narration filler (all sentences skipped, nothing
-        # real was spoken) AND the model didn't explicitly emit a directive, the
-        # model is stalling — drop to sleep instead of looping on filler turns.
-        if (directive == "stay" and not _had_directive
-                and not content_enqueued[0]):
-            print(f"[dir] override stay->sleep (no content, no model directive)", flush=True)
-            directive = "sleep"
-        print(f"[dir] {directive!r} (model_emitted={_had_directive})", flush=True)
+    # The agent owns [[stay]]/[[sleep]] on escalated turns (router intent only
+    # governs the turns it answered itself, which returned early above).
+    # Prefer what we caught during streaming; fall back to a final scan; then
+    # to the "stay" default (matches SOUL.md and the conversational expectation).
+    directive = seen_dir[0] or last_in_buf or "stay"
+    _had_directive = bool(seen_dir[0] or last_in_buf)
+    # If the assistant actually said goodbye, override to sleep — model often
+    # drifts and emits the wrong directive (or none) on close turns.
+    if directive == "stay" and assistant_signals_close(clean_full):
+        print(f"[dir] override stay->sleep (assistant said goodbye)", flush=True)
+        directive = "sleep"
+    # If the reply was 100% narration filler (all sentences skipped, nothing
+    # real was spoken) AND the model didn't explicitly emit a directive, the
+    # model is stalling — drop to sleep instead of looping on filler turns.
+    # (The escalate ack counts as content — so this only fires when neither
+    # the router ack nor any agent sentence was spoken.)
+    if (directive == "stay" and not _had_directive
+            and not content_enqueued[0]):
+        print(f"[dir] override stay->sleep (no content, no model directive)", flush=True)
+        directive = "sleep"
+    print(f"[dir] {directive!r} (model_emitted={_had_directive})", flush=True)
     # Flush whatever is left after the last sentence boundary, minus the directive.
     if clean_full:
         remaining = clean_full[min(spoken_idx[0], len(clean_full)):].strip()
