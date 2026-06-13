@@ -15,9 +15,10 @@ This repo is a **Python package** (`iva`, src layout):
 - `src/iva/` — the on-device app as an importable package. `cli.py` is the
   single **`iva`** entry point (`iva run` = the daemon, `iva install`, `iva
   display`, `iva volume`, `iva audio`, `iva devices`). Modules: `wake.py` (daemon),
-  `display.py`, `audio.py` + `volume.py` (also exposed as `iva-audio`/`iva-volume`
-  aliases), `narration_filter.py`, `speaker_gate.py`, `service.py` (the `iva
-  install` systemd setup), `devices.py`, and `data/SOUL.md` (package data).
+  `router.py` (tier-1 no-tools 12B triage), `display.py`, `audio.py` + `volume.py`
+  (also exposed as `iva-audio`/`iva-volume` aliases), `narration_filter.py`,
+  `speaker_gate.py`, `service.py` (the `iva install` systemd setup), `devices.py`,
+  and `data/SOUL.md` (package data).
   Greenfield is `pip install iva-hermes && iva run` — no repo clone; deps pull
   `hermes-agent` + the audio stack (`pymicro-wakeword` = the microWakeWord
   runtime). The wake-word **models** are bundled here as package data
@@ -30,17 +31,53 @@ This repo is a **Python package** (`iva`, src layout):
   the unit + wake-word models).
 - `src/iva/ble/` — the **companion-app setup service** (`iva-ble`, systemd unit
   `iva-ble.service`): a bless GATT peripheral ("Iva Setup") speaking JSON-RPC —
-  `rpc.py` (transport-agnostic dispatch + password/token auth in `auth.py`),
-  `handlers.py` (status/wifi/models/wakeword/audio/volume/bluetooth/apply).
+  `rpc.py` (transport-agnostic dispatch + **passwordless** auth in `auth.py`:
+  proximity-at-setup trust — the first client claims the device with
+  `auth.pair` and holds a durable secret; more phones via a 60 s
+  `auth.pair_window`; the web console via a one-time 6-digit `auth.web_code`),
+  `handlers.py` (status/wifi/models/wakeword/audio/volume/bluetooth/net.info/
+  device.reset/apply, plus `device.set_timezone`/`device.timezone` — the app
+  pushes its IANA timezone on connect so Iva's clock/reminders/cron match the
+  owner; writes the Hermes `timezone` config that `hermes_time.py` reads, no
+  sudo, effective next agent restart). The broadcast is **pairing-aware** (`server.py`): it
+  stops once a phone holds a pairing secret and the device is online (the app
+  uses the LAN API), and resumes when the network drops (BLE rescue) or after
+  a factory reset (`iva reset`, the `device.reset` RPC, or a GPIO button —
+  `reset_button.py`, armed by `IVA_RESET_GPIO`; wipe semantics in `reset.py`).
   The Flutter app `cloudomate/iva-app` is the BLE central; UUIDs must stay in
   sync with its `lib/ble/protocol.dart`.
 - `src/iva/api/` — the **web-console service** (`iva-api`, `iva-api.service`,
   port **8800**): FastAPI second transport over the SAME rpc/auth/handlers —
   `POST /rpc`, `WS /chat` (streaming text turns through the same AIAgent setup
   + history file as the voice daemon: one conversation across voice and web),
-  extra shared actions `chat.history` + `skills.*` (`actions.py`), and statically
-  serves the SPA from `cloudomate/iva-web` (`~/.local/share/iva-web`). Tokens
-  are per-process: a BLE login is not valid on the API and vice versa.
+  extra shared actions `chat.history` + `chat.send` (non-streaming turn,
+  accepts base64 `image` and `audio` voice-note attachments). **Image turns
+  bypass the agent** and call the vision model directly (`_vision_reply`):
+  image-before-text, `enable_thinking:false` (else gemma buries the answer in
+  `reasoning_content` and returns empty), because the agent's own image
+  pipeline (`auxiliary.vision`) isn't wired for the custom provider and 502s/
+  times out. Audio is Whisper-transcribed then runs as a normal agent turn. `skills.*` (incl. `skills.enable`/
+  `skills.disable`, which edit the `skills.disabled` list in
+  `~/.hermes/config.yaml` — the list Hermes' skills loader reads), and
+  `skills.sources` (registry picker for `skills.search --source`),
+  `skills.github_token`/`skills.set_github_token` (GITHUB_TOKEN in `.env` for
+  private/rate-limited GitHub search+install — the web console's "Find new
+  skills" searches public + private and installs individual skills; whole-repo
+  `skills.taps`/`tap_add`/`tap_remove` RPCs still exist but the console UI for
+  them was dropped in favor of per-skill install). `skills.install` parses the
+  real outcome (`hermes skills install` exits 0 even when it no-ops): returns
+  `installed`/`blocked`(security-scan caution, needs `force:true`)/`already`,
+  `tools.*` (toolset enable/disable via `hermes tools`; enable also runs
+  `hermes doctor --fix` to pull in add-ons), `gateway.*`, and `dev.exec` (the
+  web console's developer terminal — also a full PTY shell at `WS /term`)
+  (`actions.py`), and statically serves the SPA from `cloudomate/iva-web`
+  (`~/.local/share/iva-web`). The API
+  serves **HTTPS by default** (`api/tls.py`: self-signed EC cert in
+  `~/.config/iva-voice/tls/`, `IVA_API_TLS=0` for plain HTTP) so LAN traffic is
+  encrypted; the app pins the cert's SHA-256 fingerprint, learned over BLE via
+  the `net.info` action (BLE→LAN trust bootstrap). Tokens are **shared across
+  transports** (hashes + expiry in `~/.config/iva-voice/tokens.json`, see
+  `ble/auth.py`): a BLE login is valid on the API and survives restarts.
 - `pyproject.toml` — packaging (hatchling); entry points `iva-audio`, `iva-volume`,
   `iva-ble`, `iva-api`; extras `ble` (bless) and `api` (fastapi, uvicorn).
 - `install.sh` — separate concern: pulls the agent skills (cloudomate/skills)
@@ -62,10 +99,27 @@ The single most important module. A headless `systemctl --user` daemon implement
 
 ```
 wake (microWakeWord, FL channel) -> beep -> record-to-silence (FL)
-  -> Whisper STT (backend) -> Hermes AIAgent (backend LLM) -> Kokoro TTS (backend)
+  -> 12B audio router, no tools (iva/router.py — ONE call: ASR + route + reply):
+       answer -> speak reply directly | escalate -> speak "Ok, let me ... for you."
+       (Whisper STT is the fallback when the router is off / didn't hear it)
+  -> Hermes AIAgent with tools (escalate only, gets the transcript text)
+  -> Kokoro TTS (backend)
   -> play (barge-in armed) -> reply directive: [[stay]] keeps mic open
                                               [[sleep]] beeps + back to wake
 ```
+
+The **two-call router** (`router.py`, `IVA_ROUTER=0` disables) makes at most
+two calls to the SAME 12B per turn: call 1 sends the turn WAV with a tiny
+no-tools prompt — ASR, answer-vs-escalate, and the spoken reply/ack blended
+into one call; call 2 is the full tool-equipped agent (text in), run only on
+escalate while the ack plays. Single-turn audio works on the 12B *because* the
+router prompt is tiny — the earlier one-pass attempt failed by drowning the
+audio attention in the full tool-laden context (that lesson built the interim
+E4B PA tier, now removed along with `personal_assistant.py`). The 12B server
+loads the thin unified-arch `mmproj-12B-F16.gguf` (projection layers only) to
+accept audio. The two prompt shapes occupy different llama.cpp slots, so both
+KV-cache prefixes stay warm (default `--parallel 4`; both slots are primed at
+startup by `_warmup_llm` + `_warmup_router`).
 
 Heavy models (LLM/STT/TTS) run on a **paired backend host** reached over the
 network; the Pi only runs the wake loop, orchestration, and hardware control.
@@ -121,6 +175,9 @@ list, but the critical ones:
 
 ### Tuning knobs (env, mostly via the systemd override)
 
+`IVA_ROUTER` (voice-input mode: unset/1 = multimodal one-call audio router,
+0 = ASR/Whisper + single-call agent; exposed to the companion app + web console
+as `voice.mode` via `models.get`/`models.set`, stored in the env override),
 `WAKE_CUTOFF` (wake sensitivity, lower = more sensitive), `WAKE_CH` (0=FL, 1=FR),
 `WAKE_MODELS_DIR`, `SPEECH_MULT`/`SPEECH_MIN` (adaptive threshold),
 `LISTENING_IDLE_TIMEOUT` (stay-mode dropback, 12 s), `BARGE_HITS_NEEDED` /
@@ -143,14 +200,42 @@ interface, update all of them (across both repos).
 
 ## Device helpers
 
-`iva.volume` / `iva.audio` are **device helpers, not skills** — package modules
-exposed as the `iva-volume` / `iva-audio` console entry points and symlinked to
+`iva.volume` / `iva.audio` / `iva.spotify` are **device helpers, not skills** —
+package modules exposed as the `iva-volume` / `iva-audio` / `iva-spotify`
+console entry points and symlinked to
 `/home/iva/.local/bin/` (the path SOUL.md and the skills reference). `iva-volume`
 wraps `wpctl` but **persists** the level to `~/.config/iva-voice/volume`, which
 `ensure-xvf-profile.sh` restores at boot. The persistence is the whole point —
 skills and SOUL.md both forbid calling `wpctl`/`pactl` directly because those
 don't survive a reboot. (`iva-volume` was a bash script; it's now a
 behaviour-preserving Python port, `IVA_VOL_MAX` default 2.50.)
+
+**Messaging gateway** — `iva/gateway.py` + `gateway.*` RPC actions: a
+declarative `PLATFORMS` spec (Telegram/Discord/Slack/WhatsApp/Teams/Google
+Chat/Gmail), each a set of `~/.hermes/.env` vars (WhatsApp is QR-paired via
+`hermes whatsapp` in the Developer terminal). Generic get/set over the env
+file (reuses `integrations._set_env_file`; secrets never returned to the
+client); the gateway service is driven via `hermes gateway install/start/
+stop/status`. The web console renders every platform from the spec (Gateway
+tab).
+
+**Email (Himalaya CLI)** — `iva/himalaya.py` + `email.*` RPC actions: assisted
+setup for the `himalaya` skill (agent reads/sends your mailbox), DISTINCT from
+the Gmail *gateway* adapter (which lets people email the agent). Installs the
+binary if missing and generates `~/.config/himalaya/config.toml` from an email
++ app password (IMAP/SMTP auto-filled for Gmail/Outlook/Yahoo/iCloud, with the
+Gmail folder aliases that are otherwise a save-to-Sent footgun).
+
+**Integrations (assisted sign-up)** — `iva/integrations.py` + the
+`integrations.*` RPC actions: Home Assistant connects with the user's normal
+HA login (device runs HA's `login_flow`, mints a long-lived token over HA's
+WebSocket, writes `HASS_URL`/`HASS_TOKEN` into `~/.hermes/.env`); Spotify uses
+Authorization Code + **PKCE** with a shared product client_id (no secret) —
+config in `~/.hermes/integrations/spotify.json` (read by `iva-spotify`,
+**survives factory reset**; legacy `~/.config/iva-voice/spotify.json` is
+migrated). The app drives Spotify consent via the `cc.cloudomate.iva://spotify`
+redirect; the web console uses `http://127.0.0.1:8898/callback` + paste-back —
+both URIs must be registered in the Spotify app dashboard.
 
 ## Wake words: runtime vs training
 

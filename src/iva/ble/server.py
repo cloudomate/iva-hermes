@@ -18,6 +18,7 @@ device-validated — this is the transport skeleton, not yet hardware-proven.
 import asyncio
 import json
 import logging
+import subprocess
 
 log = logging.getLogger("iva.ble")
 
@@ -90,11 +91,62 @@ async def serve():
     await server.add_new_characteristic(
         SVC_UUID, STATUS_UUID, nprops, b"", GATTAttributePermissions.readable)
 
-    await server.start()
-    log.info("iva-ble: advertising %r (service %s)", DEVICE_NAME, SVC_UUID)
-    print(f"iva-ble: advertising {DEVICE_NAME!r} — connect from the app", flush=True)
+    # Physical factory-reset button (no-op unless IVA_RESET_GPIO is set).
+    # Kept referenced so gpiozero's callbacks stay alive for the process.
+    from iva.reset_button import maybe_start_thread
+    _reset_btn = maybe_start_thread()  # noqa: F841
+
+    # --- pairing-aware advertising gate ---------------------------------
+    # Out-of-box (no password yet): advertise so the app can onboard.
+    # Paired: stop the broadcast — strangers in BLE range see nothing; the
+    #   app talks over the encrypted LAN API (it knows host + pin + secret).
+    # Rescue: if the device loses its network, the paired phone can't reach
+    #   the LAN API either — resume advertising so BLE can fix the Wi-Fi.
+    # A factory reset (`iva reset` / device.reset / GPIO button) clears the
+    # pairing, so the gate re-opens within one poll interval.
+    def _lan_ok():
+        try:
+            out = subprocess.run(["hostname", "-I"], capture_output=True,
+                                 text=True, timeout=5).stdout
+            return bool(out.strip())
+        except Exception:
+            return False
+
+    def _should_advertise():
+        # Advertise while unpaired (out-of-box onboarding), while a pairing
+        # window is open (share access), or while offline (BLE rescue).
+        from . import auth
+        return (not auth.has_paired_devices()) or auth.pair_window_open() or (not _lan_ok())
+
+    async def _is_connected():
+        # bless API variance: sync or async depending on backend/version.
+        try:
+            r = server.is_connected()
+            return (await r) if asyncio.iscoroutine(r) else bool(r)
+        except Exception:
+            return False
+
+    advertising = _should_advertise()
+    if advertising:
+        await server.start()
+        log.info("iva-ble: advertising %r (service %s)", DEVICE_NAME, SVC_UUID)
+        print(f"iva-ble: advertising {DEVICE_NAME!r} — connect from the app", flush=True)
+    else:
+        print("iva-ble: paired + online — BLE broadcast off (app uses the LAN API; "
+              "broadcast resumes if the network drops or after a reset)", flush=True)
     try:
         while True:
-            await asyncio.sleep(3600)
+            await asyncio.sleep(5)  # short poll so a pairing window airs promptly
+            want = _should_advertise()
+            if want and not advertising:
+                await server.start()
+                advertising = True
+                print("iva-ble: broadcast resumed (unpaired or network down)", flush=True)
+            elif not want and advertising and not await _is_connected():
+                # Don't cut an in-flight BLE session; stop once idle.
+                await server.stop()
+                advertising = False
+                print("iva-ble: paired + online — broadcast stopped", flush=True)
     finally:
-        await server.stop()
+        if advertising:
+            await server.stop()

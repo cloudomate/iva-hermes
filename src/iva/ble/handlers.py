@@ -21,13 +21,25 @@ class CmdError(Exception):
 
 
 def _run(cmd, timeout=20):
-    try:
-        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-        return p.returncode, p.stdout, p.stderr
-    except FileNotFoundError:
-        raise CmdError(f"{cmd[0]} not found on this device")
-    except subprocess.TimeoutExpired:
-        raise CmdError(f"{cmd[0]} timed out")
+    # The systemd --user services run with a minimal PATH that excludes
+    # ~/.local/bin, where the iva-* helpers live — fall back to it explicitly.
+    # wpctl & co. also need XDG_RUNTIME_DIR to find the PipeWire socket.
+    env = dict(os.environ)
+    env.setdefault("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    candidates = [cmd]
+    local = os.path.expanduser(os.path.join("~", ".local", "bin", cmd[0]))
+    if "/" not in cmd[0] and os.path.isfile(local):
+        candidates.append([local] + cmd[1:])
+    for i, c in enumerate(candidates):
+        try:
+            p = subprocess.run(c, capture_output=True, text=True,
+                               timeout=timeout, env=env)
+            return p.returncode, p.stdout, p.stderr
+        except FileNotFoundError:
+            if i == len(candidates) - 1:
+                raise CmdError(f"{cmd[0]} not found on this device")
+        except subprocess.TimeoutExpired:
+            raise CmdError(f"{cmd[0]} timed out")
 
 
 def _read_env_override():
@@ -82,26 +94,49 @@ def _set_env(updates):
 # ----------------------------------------------------------------- auth / hello
 def h_hello(_p):
     import iva
-    return {"name": "Iva", "version": getattr(iva, "__version__", "?"), "auth_set": auth.is_set()}
+    return {"name": "Iva", "version": getattr(iva, "__version__", "?"),
+            "paired": auth.has_paired_devices(), "pair_open": auth.pair_window_open()}
 
 
 def h_auth_status(_p):
-    return {"auth_set": auth.is_set()}
-
-
-def h_auth_setup(p):
-    try:
-        auth.setup(p.get("password", ""))
-        return {"token": auth.login(p["password"])}
-    except ValueError as e:
-        raise CmdError(str(e))
+    return {"paired": auth.has_paired_devices(), "pair_open": auth.pair_window_open()}
 
 
 def h_auth_login(p):
+    # Passwordless: a paired-device secret (phones) or a one-time 6-digit
+    # code minted by a paired phone (web console).
     try:
-        return {"token": auth.login(p.get("password", ""))}
+        if p.get("code"):
+            return {"token": auth.login_code(str(p["code"]))}
+        return {"token": auth.login_secret(p.get("secret") or "")}
     except ValueError as e:
         raise CmdError(str(e))
+
+
+def h_auth_pair(p):
+    """Claim or join: open action, but auth.pair itself only succeeds
+    out-of-box (no paired devices yet — proximity at setup is the trust) or
+    during a pairing window opened from an already-paired phone. Returns the
+    durable per-device secret the caller stores and logs in with forever."""
+    try:
+        return {"secret": auth.pair((p.get("name") or "").strip()[:64])}
+    except ValueError as e:
+        raise CmdError(str(e))
+
+
+def h_auth_pair_window(_p):
+    """Share access (token-gated): allow ONE more phone to pair in the next
+    minute; the BLE broadcast resumes for the duration."""
+    return {"open_s": auth.open_pair_window()}
+
+
+def h_auth_web_code(_p):
+    """Mint the web console's one-time login code (token-gated). Includes the
+    console URL so the app can show 'go here, type this'."""
+    code, ttl = auth.web_code()
+    info = h_net_info({})
+    url = f"{info['scheme']}://{info['ip'] or info['hostname']}:{info['port']}"
+    return {"code": code, "ttl_s": ttl, "url": url}
 
 
 # ----------------------------------------------------------------------- status
@@ -136,14 +171,24 @@ def h_logs_get(p):
 _MODEL_KEYS = ["llm.model", "llm.url", "llm.key", "stt.model", "stt.url", "stt.key",
                "tts.model", "tts.voice", "tts.url", "tts.key"]
 
+# Voice-input mode: "multimodal" = the turn audio goes straight to the LLM
+# (one-call 12B audio router, the default), "asr" = transcribe with the STT
+# endpoint first + single-call agent. Stored as the IVA_ROUTER env override
+# the wake daemon reads (absent/on = multimodal, 0/off = asr); either mode
+# keeps STT as the fallback path, so the STT endpoint stays configured.
+_VOICE_MODES = ("multimodal", "asr")
+
+
+def _voice_mode():
+    v = (_read_env_override().get("IVA_ROUTER") or "1").strip().lower()
+    return "asr" if v in ("0", "false", "no", "off") else "multimodal"
+
 
 def h_models_get(_p):
     from iva import config_cmd as c
     cfg = c._load()
     out = {k: c._get(cfg, c.KEYMAP[k]) for k in _MODEL_KEYS if not k.endswith(".key")}
-    pa = cfg.get("personal_assistant") or {}
-    out["pa.url"] = pa.get("base_url")
-    out["pa.model"] = pa.get("model")
+    out["voice.mode"] = _voice_mode()
     return out
 
 
@@ -159,12 +204,11 @@ def h_models_set(p):
             c._set(cfg, c.KEYMAP[k], v)
             touched_stt |= k.startswith("stt.")
             touched_tts |= k.startswith("tts.")
-        elif k == "pa.url":
-            c._set(cfg, ("personal_assistant", "base_url"), v)
-        elif k == "pa.model":
-            c._set(cfg, ("personal_assistant", "model"), v)
-        elif k == "pa.key":
-            c._set(cfg, ("personal_assistant", "api_key"), v)
+        elif k == "voice.mode":
+            mode = str(v).strip().lower()
+            if mode not in _VOICE_MODES:
+                raise CmdError("voice.mode must be 'multimodal' or 'asr'")
+            _set_env({"IVA_ROUTER": "0" if mode == "asr" else None})
         else:
             raise CmdError(f"unknown model key {k!r}")
     if touched_stt:
@@ -349,6 +393,147 @@ def h_bt_pair(p):
     return {"ok": True, "steps": results}
 
 
+# ------------------------------------------------------------ net (LAN handoff)
+def h_net_info(_p):
+    """LAN endpoint + TLS pin for the paired app. After BLE onboarding the app
+    switches to the faster HTTPS API on the LAN; it verifies the self-signed
+    cert by this fingerprint (trust bootstrapped over the BLE channel), and the
+    BLE-issued token works there too (shared token store — see ble/auth.py)."""
+    import socket
+    from iva.api import tls
+    tls_on = (os.environ.get("IVA_API_TLS") or "1").strip().lower() not in ("0", "false", "no", "off")
+    return {
+        "ip": h_wifi_status({}).get("ip"),
+        "hostname": socket.gethostname(),
+        "port": int(os.environ.get("IVA_API_PORT", "8800")),
+        "scheme": "https" if tls_on else "http",
+        "cert_sha256": tls.fingerprint() if tls_on else None,
+    }
+
+
+# ------------------------------------------------- integrations (HA + Spotify)
+# Assisted sign-up — see iva/integrations.py. All ValueError -> CmdError so the
+# app/web get clean user-facing messages.
+def _ig():
+    from iva import integrations
+    return integrations
+
+
+def h_integrations_status(_p):
+    return _ig().status()
+
+
+def h_integrations_ha_discover(_p):
+    return {"instances": _ig().ha_discover()}
+
+
+def h_integrations_ha_login(p):
+    try:
+        return _ig().ha_login(p.get("url") or "", p.get("username") or "",
+                              p.get("password") or "", p.get("mfa_code"))
+    except ValueError as e:
+        raise CmdError(str(e))
+
+
+def h_integrations_spotify_begin(p):
+    try:
+        return _ig().spotify_begin(p.get("redirect_uri") or "")
+    except ValueError as e:
+        raise CmdError(str(e))
+
+
+def h_integrations_spotify_exchange(p):
+    try:
+        return _ig().spotify_exchange(p.get("code") or "")
+    except ValueError as e:
+        raise CmdError(str(e))
+
+
+def h_integrations_spotify_set_device(p):
+    try:
+        return _ig().spotify_set_device(p.get("name") or "")
+    except ValueError as e:
+        raise CmdError(str(e))
+
+
+# Himalaya email CLI (agent operates a mailbox) — assisted setup.
+def h_email_status(_p):
+    from iva import himalaya
+    return himalaya.status()
+
+
+def h_email_install(_p):
+    from iva import himalaya
+    try:
+        return himalaya.install()
+    except Exception as e:
+        raise CmdError(str(e)[:300])
+
+
+def h_email_configure(p):
+    from iva import himalaya
+    try:
+        return himalaya.configure(
+            p.get("email") or "", p.get("password") or "",
+            imap_host=p.get("imap_host"), imap_port=p.get("imap_port"),
+            smtp_host=p.get("smtp_host"), smtp_port=p.get("smtp_port"),
+            smtp_encryption=p.get("smtp_encryption"))
+    except ValueError as e:
+        raise CmdError(str(e))
+
+
+def h_email_test(_p):
+    from iva import himalaya
+    try:
+        return himalaya.test()
+    except ValueError as e:
+        raise CmdError(str(e))
+
+
+# ----------------------------------------------------------------- timezone
+def h_device_timezone(_p):
+    from iva import config_cmd as c
+    return {"tz": (c._load().get("timezone") or "")}
+
+
+def h_device_set_timezone(p):
+    """Set the assistant's IANA timezone (from the paired phone) so its sense
+    of time, reminders and cron match the owner. Writes the Hermes `timezone`
+    config (what hermes_time.py reads — no sudo); also best-effort sets the
+    system clock zone (usually needs sudo, ignored on failure)."""
+    tz = (p.get("tz") or "").strip()
+    if not tz:
+        raise CmdError("tz required")
+    try:
+        from zoneinfo import ZoneInfo
+        ZoneInfo(tz)
+    except Exception:
+        raise CmdError(f"unknown timezone {tz!r}")
+    from iva import config_cmd as c
+    cfg = c._load()
+    changed = (cfg.get("timezone") or "") != tz
+    c._set(cfg, ("timezone",), tz)
+    c._save(cfg)
+    # best-effort system tz (no-op without passwordless sudo)
+    try:
+        subprocess.run(["sudo", "-n", "timedatectl", "set-timezone", tz],
+                       capture_output=True, timeout=8)
+    except Exception:
+        pass
+    return {"tz": tz, "changed": changed, "restart_needed": changed}
+
+
+# -------------------------------------------------------------------- reset
+def h_device_reset(_p):
+    """Factory-style reset for re-pairing (token-gated): wipes the password,
+    paired-device secrets, tokens, TLS cert, app-set settings, history and
+    logs, then restarts the services — the BLE setup broadcast comes back on
+    and the device onboards like new. Backend endpoints/keys are kept (see
+    iva/reset.py). The caller's token dies with the reset, by design."""
+    from iva.reset import reset
+    return reset(restart=True)
+
+
 # -------------------------------------------------------------------- apply
 def h_apply(_p):
     _run(["systemctl", "--user", "daemon-reload"], timeout=15)  # pick up env drop-in edits
@@ -360,12 +545,24 @@ def h_apply(_p):
 
 REGISTRY = {
     "hello": h_hello,
-    "auth.status": h_auth_status, "auth.setup": h_auth_setup, "auth.login": h_auth_login,
+    "auth.status": h_auth_status, "auth.login": h_auth_login, "auth.pair": h_auth_pair,
+    "auth.pair_window": h_auth_pair_window, "auth.web_code": h_auth_web_code,
     "status.get": h_status_get, "logs.get": h_logs_get,
     "models.get": h_models_get, "models.set": h_models_set,
     "wifi.scan": h_wifi_scan, "wifi.connect": h_wifi_connect, "wifi.status": h_wifi_status,
     "wakeword.list": h_wakeword_list, "wakeword.set": h_wakeword_set, "wakeword.upload": h_wakeword_upload,
     "audio.devices": h_audio_devices, "volume.get": h_volume_get, "volume.set": h_volume_set,
     "bluetooth.scan": h_bt_scan, "bluetooth.pair": h_bt_pair,
+    "net.info": h_net_info,
+    "integrations.status": h_integrations_status,
+    "integrations.ha_discover": h_integrations_ha_discover,
+    "integrations.ha_login": h_integrations_ha_login,
+    "integrations.spotify_begin": h_integrations_spotify_begin,
+    "integrations.spotify_exchange": h_integrations_spotify_exchange,
+    "integrations.spotify_set_device": h_integrations_spotify_set_device,
+    "email.status": h_email_status, "email.install": h_email_install,
+    "email.configure": h_email_configure, "email.test": h_email_test,
+    "device.timezone": h_device_timezone, "device.set_timezone": h_device_set_timezone,
+    "device.reset": h_device_reset,
     "apply": h_apply,
 }

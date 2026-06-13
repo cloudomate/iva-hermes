@@ -10,8 +10,10 @@ import traceback
 
 from . import auth, handlers
 
-# actions allowed before/without a session token (bootstrap + onboarding entry)
-_OPEN = {"hello", "auth.status", "auth.setup", "auth.login"}
+# actions allowed before/without a session token (bootstrap + onboarding entry).
+# auth.pair is open at the transport but self-gates: it only succeeds
+# out-of-box or during a pairing window (see auth.pair / handlers.h_auth_pair).
+_OPEN = {"hello", "auth.status", "auth.login", "auth.pair"}
 
 
 def dispatch(req):

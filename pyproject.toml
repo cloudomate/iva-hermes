@@ -44,6 +44,7 @@ api = ["fastapi", "uvicorn"]  # web-console service (HTTP/WS API + static SPA)
 iva = "iva.cli:main"
 iva-audio = "iva.audio:main"
 iva-volume = "iva.volume:main"
+iva-spotify = "iva.spotify:main"
 iva-ble = "iva.ble.cli:main"
 iva-api = "iva.api.cli:main"
 
