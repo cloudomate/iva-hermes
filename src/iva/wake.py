@@ -37,8 +37,13 @@ WAKE_CH = _AUDIO["wake_channel"]            # channel read_fl() extracts when mu
 AUDIO_SOURCE = _AUDIO["source"]             # device name substring / index / None=default
 AUDIO_SINK = _AUDIO["sink"]
 AUDIO_CHANNELS = _AUDIO["channels"]         # int, or None = auto (try 6 then mono)
-print(f"[audio] preset={_AUDIO['preset']} source={AUDIO_SOURCE!r} sink={AUDIO_SINK!r} "
+print(f"[audio] preset={_AUDIO['preset']} ({_AUDIO.get('selected_via')}) "
+      f"source={AUDIO_SOURCE!r} sink={AUDIO_SINK!r} "
       f"channels={AUDIO_CHANNELS} wake_ch={WAKE_CH}", flush=True)
+# The active profile can carry the volume ceiling; propagate it so child
+# iva-volume calls (voice "louder") clamp to this hardware's safe max.
+if _AUDIO.get("vol_max") is not None:
+    os.environ["IVA_VOL_MAX"] = str(_AUDIO["vol_max"])
 
 def _resolve_dev(spec):
     if spec is None:
@@ -53,7 +58,7 @@ def _apply_default_devices():
     if src is not None or snk is not None:
         sd.default.device = (src, snk)
 _apply_default_devices()
-WAKE_CUTOFF = float(os.environ.get("WAKE_CUTOFF", "0.5"))
+WAKE_CUTOFF = float(_AUDIO["wake_cutoff"] if _AUDIO.get("wake_cutoff") is not None else 0.5)
 # Stay-mode safety: if LLM says [[stay]] but user never speaks, drop back to SLEEP.
 LISTENING_IDLE_TIMEOUT = float(os.environ.get("LISTENING_IDLE_TIMEOUT", "12.0"))
 # Quiet gap after a sleep beep before re-arming wake-listen. Prevents the
@@ -71,8 +76,8 @@ BARGE_RMS_MULT = float(os.environ.get("BARGE_RMS_MULT", "2.0"))
 # --- adaptive noise floor: auto-tune speech/silence thresholds to the room ---
 noise_floor = [250.0]                                  # EMA of ambient FL RMS
 NOISE_ALPHA = 0.05
-SPEECH_MULT = float(os.environ.get("SPEECH_MULT", "3.5"))   # speech = floor * this
-SPEECH_MIN  = float(os.environ.get("SPEECH_MIN", "600"))    # absolute floor
+SPEECH_MULT = float(_AUDIO["speech_mult"] if _AUDIO.get("speech_mult") is not None else 3.5)
+SPEECH_MIN  = float(_AUDIO["speech_min"] if _AUDIO.get("speech_min") is not None else 600)  # absolute floor
 def speech_threshold():
     return max(SPEECH_MIN, noise_floor[0] * SPEECH_MULT)
 def _update_noise(rms):

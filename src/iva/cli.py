@@ -49,15 +49,23 @@ def _config(rest):
 
 
 def _presets(rest):
-    from iva.audio_config import available_presets, resolve
-    cur = resolve()
-    print("device presets:")
-    for n in available_presets():
-        print(("  * " if n == cur["preset"] else "    ") + n)
-    print(f"\nactive: {cur['preset']}  (source={cur['source']!r} sink={cur['sink']!r} "
-          f"channels={cur['channels']} wake_ch={cur['wake_channel']})")
-    print("\nselect: iva run --preset <name>  |  IVA_AUDIO_PRESET=<name>  |  "
-          "~/.config/iva-voice/audio.yaml")
+    from iva.audio_config import describe
+    d = describe()
+    print("hardware profiles:")
+    for p in d["profiles"]:
+        flags = "".join([" *" if p["active"] else "  ",
+                         "[detected]" if p["detected"] else ""])
+        print(f"  {flags} {p['name']:<20} {p['label']}")
+    cur = next((p for p in d["profiles"] if p["active"]), None)
+    f = cur["fields"] if cur else {}
+    print(f"\nactive: {d['active']}  (via {d['selected_via']})  "
+          f"source={f.get('source')!r} sink={f.get('sink')!r} "
+          f"channels={f.get('channels')} wake_ch={f.get('wake_channel')} "
+          f"cutoff={f.get('wake_cutoff')} vol_max={f.get('vol_max')}")
+    print(f"detected for plugged hardware: {d['detected']}")
+    print(f"connected cards: {d['cards']}")
+    print("\nselect: iva run --preset <name|auto>  |  IVA_AUDIO_PRESET=<name>  |  "
+          "app/web 'audio.select_profile'")
 
 
 def _display(rest):

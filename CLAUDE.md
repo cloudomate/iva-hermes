@@ -137,18 +137,30 @@ which `iva.display` (optional `rich` UI) reads.
 These are hard-won and easy to regress — the device README documents the full
 list, but the critical ones:
 
-1. **Audio is generic (PipeWire/sounddevice) and config-driven; multi-channel
-   arrays must be pinned.** Resolution lives in `iva/audio_config.py`: a named
-   **preset** supplies defaults (`generic` = system default + mono; built-in
-   `respeaker-xvf3800` = 6ch + extract ch0), chosen via `IVA_AUDIO_PRESET` /
-   `~/.config/iva-voice/audio.yaml` (`preset:`) / `iva run --preset`. The user
-   file can define custom presets + `overrides:`. Env always wins:
-   `AUDIO_SOURCE`/`AUDIO_SINK` (name substring or index → `sd.default.device`),
-   `AUDIO_CHANNELS` (capture count; unset = auto-try 6 then mono), `WAKE_CH`
-   (channel `read_fl()` extracts when channels > 1). **XVF3800 is one such preset:** its `analog-surround-51`
-   profile exposes 6ch (FL FR FC LFE RL RR) whose default mono *downmixes* +
-   dilutes the voice ~5×, so set `AUDIO_CHANNELS=6 WAKE_CH=0` and force the
-   profile with `ensure-xvf-profile.sh`. Use `iva devices` to find node names.
+1. **Audio is generic (PipeWire/sounddevice) and config-driven via hardware
+   profiles.** Resolution lives in `iva/audio_config.py`: a named **profile**
+   (preset) supplies defaults and is **auto-detected** from the plugged-in
+   sound card (each profile's `match` substring vs `/proc/asound/cards`), or
+   selected manually. Selection order: `IVA_AUDIO_PRESET` env → `preset:` in
+   `~/.config/iva-voice/audio.yaml` (both accept `auto`) → auto-detect →
+   `generic`. Built-ins: `generic` (system default + mono), `respeaker-xvf3800`
+   (6ch + extract ch0), `anker-powerconf` (Anker PowerConf S330 USB
+   speakerphone: mono, cutoff 0.85, vol_max 1.00). Profile fields: routing
+   (`source`/`sink`/`channels`/`wake_channel`), wake tuning
+   (`wake_cutoff`/`speech_min`/`speech_mult`), volume (`vol_max`/
+   `default_volume`), plus `match`/`label`. Per-field env always wins
+   (`AUDIO_SOURCE`/`AUDIO_SINK`/`AUDIO_CHANNELS`/`WAKE_CH`/`WAKE_CUTOFF`/
+   `SPEECH_MIN`/`SPEECH_MULT`/`IVA_VOL_MAX`). App/web control via RPCs
+   `audio.profiles`/`audio.select_profile`/`audio.save_profile` (then `apply`
+   to restart); CLI `iva presets`. **Never pin a raw ALSA hw device** as
+   `source` (e.g. `AUDIO_SOURCE=Anker` → `hw:0,0`): it skips PipeWire
+   resampling and the daemon crash-loops on 16 kHz capture with PortAudio
+   `-9997 Invalid sample rate` — leave `source=None` to use the PipeWire
+   default. **XVF3800** exposes 6ch (FL FR FC LFE RL RR) whose default mono
+   *downmixes* + dilutes the voice ~5×, so it captures 6ch/extract FL and forces
+   its `analog-surround-51` profile via `ensure-xvf-profile.sh` (now generic:
+   only touches the XVF card if present, always restores volume). Use
+   `iva devices` to find node names.
 2. **Do NOT use Hermes' bundled `create_audio_recorder()`.** Opening its threaded
    PortAudio stream right after the wake stream closed caused a **hard segfault**
    (PortAudio re-entrancy). `record_to_silence()` is a deliberate
