@@ -44,6 +44,12 @@ This repo is a **Python package** (`iva`, src layout):
   uses the LAN API), and resumes when the network drops (BLE rescue) or after
   a factory reset (`iva reset`, the `device.reset` RPC, or a GPIO button —
   `reset_button.py`, armed by `IVA_RESET_GPIO`; wipe semantics in `reset.py`).
+  A paired owner can also keep BLE reachable AFTER onboarding without a reset:
+  an always-on toggle (`ble.set_always`, persisted, or the `IVA_BLE_ALWAYS_ON`
+  env) or an on-demand connect window (`ble.open`, ~5 min, usually called over
+  the LAN API since BLE is dark when it's needed) — both flip the same
+  `_should_advertise()` gate; `ble.status` reports them. Access stays
+  token-gated either way (no new pairing — that's still `auth.pair_window`).
   The Flutter app `cloudomate/iva-app` is the BLE central; UUIDs must stay in
   sync with its `lib/ble/protocol.dart`.
 - `src/iva/api/` — the **web-console service** (`iva-api`, `iva-api.service`,
