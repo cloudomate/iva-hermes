@@ -387,6 +387,59 @@ def h_volume_set(p):
     return {"raw": (out or err).strip()}
 
 
+# ------------------------------------------------------ audio hardware profiles
+def h_audio_profiles(_p):
+    """List hardware profiles for the app: name/label/fields, which is active,
+    which is auto-detected for the plugged-in hardware, plus the cards seen."""
+    from iva import audio_config
+    return audio_config.describe()
+
+
+def _stage_profile_volume(name):
+    # If the profile defines a default volume, stage it (clamped to its ceiling)
+    # into the persisted volume file so the restart applies it on this hardware.
+    from iva import audio_config
+    p = {**audio_config._FIELD_DEFAULTS, **audio_config._all_presets().get(name, {})}
+    dv, vmax = p.get("default_volume"), p.get("vol_max")
+    if dv is None:
+        return None
+    v = min(float(dv), float(vmax)) if vmax is not None else float(dv)
+    vol_file = os.path.expanduser("~/.config/iva-voice/volume")
+    os.makedirs(os.path.dirname(vol_file), exist_ok=True)
+    with open(vol_file, "w") as f:
+        f.write(f"{v:.2f}")
+    return v
+
+
+def h_audio_select_profile(p):
+    """Pick a hardware profile (token-gated). ``name='auto'`` re-enables
+    auto-detect. Persisted; takes effect on ``apply`` (daemon restart)."""
+    from iva import audio_config
+    name = (p.get("name") or "auto").strip()
+    try:
+        chosen = audio_config.select_preset(name)
+    except ValueError as e:
+        raise CmdError(str(e))
+    staged_vol = None if name == "auto" else _stage_profile_volume(name)
+    return {"preset": chosen, "staged_volume": staged_vol,
+            "note": "call 'apply' to restart and take effect"}
+
+
+def h_audio_save_profile(p):
+    """Create/update a profile's fields (token-gated): routing (source/sink/
+    channels/wake_channel), wake tuning (wake_cutoff/speech_min/speech_mult),
+    and volume (vol_max/default_volume). Persisted to audio.yaml."""
+    from iva import audio_config
+    name = (p.get("name") or "").strip()
+    fields = p.get("fields") or {}
+    if not isinstance(fields, dict):
+        raise CmdError("fields must be an object")
+    try:
+        return audio_config.save_profile(name, fields)
+    except ValueError as e:
+        raise CmdError(str(e))
+
+
 # ----------------------------------------------------- bluetooth (bluetoothctl)
 def h_bt_scan(p):
     secs = int(p.get("seconds", 8))
@@ -574,6 +627,8 @@ REGISTRY = {
     "wifi.scan": h_wifi_scan, "wifi.connect": h_wifi_connect, "wifi.status": h_wifi_status,
     "wakeword.list": h_wakeword_list, "wakeword.set": h_wakeword_set, "wakeword.upload": h_wakeword_upload,
     "audio.devices": h_audio_devices, "volume.get": h_volume_get, "volume.set": h_volume_set,
+    "audio.profiles": h_audio_profiles, "audio.select_profile": h_audio_select_profile,
+    "audio.save_profile": h_audio_save_profile,
     "bluetooth.scan": h_bt_scan, "bluetooth.pair": h_bt_pair,
     "net.info": h_net_info,
     "integrations.status": h_integrations_status,
