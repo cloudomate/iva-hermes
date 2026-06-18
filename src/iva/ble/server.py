@@ -102,6 +102,9 @@ async def serve():
     #   app talks over the encrypted LAN API (it knows host + pin + secret).
     # Rescue: if the device loses its network, the paired phone can't reach
     #   the LAN API either — resume advertising so BLE can fix the Wi-Fi.
+    # Owner opt-in: a paired owner can keep BLE reachable after onboarding via
+    #   the always-on toggle (auth.ble_always_on) or an on-demand connect
+    #   window (auth.ble_window_open) — access stays token-gated either way.
     # A factory reset (`iva reset` / device.reset / GPIO button) clears the
     # pairing, so the gate re-opens within one poll interval.
     def _lan_ok():
@@ -114,9 +117,11 @@ async def serve():
 
     def _should_advertise():
         # Advertise while unpaired (out-of-box onboarding), while a pairing
-        # window is open (share access), or while offline (BLE rescue).
+        # window is open (share access), while the owner has opted into post-pair
+        # BLE access (always-on toggle or on-demand window), or offline (rescue).
         from . import auth
-        return (not auth.has_paired_devices()) or auth.pair_window_open() or (not _lan_ok())
+        return ((not auth.has_paired_devices()) or auth.pair_window_open()
+                or auth.ble_always_on() or auth.ble_window_open() or (not _lan_ok()))
 
     async def _is_connected():
         # bless API variance: sync or async depending on backend/version.

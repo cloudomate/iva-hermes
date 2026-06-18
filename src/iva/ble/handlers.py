@@ -130,6 +130,27 @@ def h_auth_pair_window(_p):
     return {"open_s": auth.open_pair_window()}
 
 
+def h_ble_status(_p):
+    """Post-pair BLE access (token-gated): is the always-on toggle set, and is
+    an on-demand connect window currently open."""
+    return {"always": auth.ble_always_on(), "window_open": auth.ble_window_open()}
+
+
+def h_ble_set_always(p):
+    """Keep BLE connectable after pairing (token-gated, persisted). When on, the
+    device keeps advertising so a paired phone can always reach it over BLE;
+    access stays token-gated. Off restores the quiet-once-online default."""
+    return {"always": auth.set_ble_always(bool(p.get("on")))}
+
+
+def h_ble_open(_p):
+    """Open an on-demand BLE connect window (token-gated): the device advertises
+    for a few minutes so a paired phone can reconnect over BLE, then goes quiet
+    again. Allows NO new pairing — use auth.pair_window to add a phone. Usually
+    called over the LAN API, since BLE is dark when this is needed."""
+    return {"open_s": auth.open_ble_window()}
+
+
 def h_auth_web_code(_p):
     """Mint the web console's one-time login code (token-gated). Includes the
     console URL so the app can show 'go here, type this'."""
@@ -547,6 +568,7 @@ REGISTRY = {
     "hello": h_hello,
     "auth.status": h_auth_status, "auth.login": h_auth_login, "auth.pair": h_auth_pair,
     "auth.pair_window": h_auth_pair_window, "auth.web_code": h_auth_web_code,
+    "ble.status": h_ble_status, "ble.set_always": h_ble_set_always, "ble.open": h_ble_open,
     "status.get": h_status_get, "logs.get": h_logs_get,
     "models.get": h_models_get, "models.set": h_models_set,
     "wifi.scan": h_wifi_scan, "wifi.connect": h_wifi_connect, "wifi.status": h_wifi_status,

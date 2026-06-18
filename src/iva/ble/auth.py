@@ -32,7 +32,8 @@ TTL_S = 12 * 3600            # phone session token
 WEB_TTL_S = 30 * 24 * 3600   # web-console session (its login is a one-time code)
 CODE_TTL_S = 120             # web one-time code lifetime
 CODE_MAX_TRIES = 5           # then the code is burned (it's only 6 digits)
-PAIR_WINDOW_S = 60           # share-access window
+PAIR_WINDOW_S = 60           # share-access window (add a NEW phone)
+BLE_WINDOW_S = 5 * 60        # on-demand post-pair BLE connect window
 
 
 def _load():
@@ -76,6 +77,42 @@ def pair_window_open():
 
 def _close_pair_window(d):
     d.pop("pair_window", None)
+
+
+# -------------------------------------------------- post-pair BLE access (own)
+# After onboarding the broadcast goes quiet (the app reaches us over the LAN
+# API). These let a paired OWNER connect over BLE again without a factory reset:
+#   * an always-on toggle (persisted, app-settable, or the IVA_BLE_ALWAYS_ON
+#     env) — keep advertising so a paired phone can always connect over BLE; and
+#   * an on-demand window (open_ble_window) the app opens over the LAN API to
+#     make the device advertise for a few minutes, then go quiet again.
+# Unlike open_pair_window this allows NO new pairing — access stays token-gated
+# (auth.pair self-closes once paired), so it only changes discoverability.
+def ble_always_on():
+    env = str(os.environ.get("IVA_BLE_ALWAYS_ON", "")).strip().lower()
+    if env in ("1", "true", "yes", "on"):
+        return True
+    return bool(_load().get("ble_always"))
+
+
+def set_ble_always(on):
+    d = _load()
+    d["ble_always"] = bool(on)
+    _save(d)
+    return bool(on)
+
+
+def open_ble_window():
+    """Advertise on demand for BLE_WINDOW_S so a paired phone can reconnect over
+    BLE (token-gated at the handler). Self-closes; allows no new pairing."""
+    d = _load()
+    d["ble_window"] = time.time() + BLE_WINDOW_S
+    _save(d)
+    return BLE_WINDOW_S
+
+
+def ble_window_open():
+    return (_load().get("ble_window") or 0) > time.time()
 
 
 # ------------------------------------------------------------------- pairing
