@@ -2,7 +2,9 @@
 """Headless wake-word voice assistant for Hermes (iva).
 Wake (microWakeWord, FL) -> record -> 12B audio router (ONE no-tools call:
 ASR + answer directly | escalate with an instant "Ok, let me ... for you."
-ack; Whisper is the fallback STT) -> agent with tools (escalate only, text)
+ack; Whisper is the STT only when the router is OFF — when the router is ON but
+hears nothing the turn is dropped unless IVA_WHISPER_FALLBACK=1) -> agent with
+tools (escalate only, text)
 -> Kokoro TTS -> play.
 After speaking, the LLM's reply directive ([[stay]] / [[sleep]]) decides the next
 state: stay opens the mic again with no wake gate (with a 12s idle dropback);
@@ -725,8 +727,9 @@ def do_turn(start_timeout_s=8):
     publish("transcribing")
     # Tier-1 router (call 1, no tools): ONE audio-in 12B call does ASR +
     # answer/escalate route + continue/drop intent + the spoken reply/ack.
-    # Whisper remains the STT fallback when the router is off, errors, or
-    # didn't hear anything (RELIABILITY CONTRACT in iva/router.py).
+    # Whisper is the STT only when the router is OFF (its primary path). When the
+    # router is ON but heard nothing, the turn is dropped (no Whisper) unless
+    # IVA_WHISPER_FALLBACK=1. See RELIABILITY CONTRACT in iva/router.py.
     rt_route, rt_intent, rt_reply, text = "escalate", "continue", "", ""
     rt_bg = False
     if _ROUTER:

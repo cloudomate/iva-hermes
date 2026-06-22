@@ -107,7 +107,9 @@ The single most important module. A headless `systemctl --user` daemon implement
 wake (microWakeWord, FL channel) -> beep -> record-to-silence (FL)
   -> 12B audio router, no tools (iva/router.py — ONE call: ASR + route + reply):
        answer -> speak reply directly | escalate -> speak "Ok, let me ... for you."
-       (Whisper STT is the fallback when the router is off / didn't hear it)
+       (Whisper STT is the primary only when the router is OFF; when the router
+        is ON but hears nothing the turn is dropped — no Whisper — unless
+        IVA_WHISPER_FALLBACK=1)
   -> Hermes AIAgent with tools (escalate only, gets the transcript text)
   -> Kokoro TTS (backend)
   -> play (barge-in armed) -> reply directive: [[stay]] keeps mic open
@@ -196,6 +198,9 @@ list, but the critical ones:
 `IVA_ROUTER` (voice-input mode: unset/1 = multimodal one-call audio router,
 0 = ASR/Whisper + single-call agent; exposed to the companion app + web console
 as `voice.mode` via `models.get`/`models.set`, stored in the env override),
+`IVA_WHISPER_FALLBACK` (default 0; when the router is ON, an empty/garbage router
+transcript drops the turn instead of falling back to Whisper — Whisper
+hallucinates on noise/false wakes; set 1 to restore the fallback),
 `WAKE_CUTOFF` (wake sensitivity, lower = more sensitive), `WAKE_CH` (0=FL, 1=FR),
 `WAKE_MODELS_DIR`, `SPEECH_MULT`/`SPEECH_MIN` (adaptive threshold),
 `LISTENING_IDLE_TIMEOUT` (stay-mode dropback, 12 s), `BARGE_HITS_NEEDED` /

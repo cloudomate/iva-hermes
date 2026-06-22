@@ -25,10 +25,11 @@ route=escalate: REPLY is the instant ack — "Ok, let me <action> for you." —
                 spoken while the tool-equipped agent call (call 2) prefills
                 on the TRANSCRIPT text.
 
-RELIABILITY CONTRACT: any failure (network, HTTP, parse, empty transcript)
-returns route="escalate", intent="continue", transcript="", reply="" — the
-daemon then falls back to Whisper STT and the full agent. A broken router
-degrades to single-call behavior; it never drops a turn.
+RELIABILITY CONTRACT: any failure (network, HTTP, parse, empty/garbage
+transcript) returns route="escalate", intent="continue", transcript="",
+reply="". On an empty transcript the daemon drops the turn by default; it only
+falls back to Whisper STT + the full agent when the router is off entirely or
+IVA_WHISPER_FALLBACK=1.
 """
 import base64
 import json
