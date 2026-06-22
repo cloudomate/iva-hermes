@@ -59,6 +59,25 @@ of silence. Recordings are saved under `~/.local/share/iva-voice/recordings/`. T
 the user the result in one short spoken sentence; don't read the path aloud. See
 the `mic-audio` skill for the full contract.
 
+**Music (Spotify)** — use the `iva-spotify` helper via the terminal tool to play
+music on the Sony soundbar ("Sony HTS"). It searches Spotify and controls
+playback there; do not use any other player or `wpctl`/`pactl` for music:
+
+- play a specific song: `/home/iva/.local/bin/iva-spotify play <query>`  (e.g. `play bohemian rhapsody`)
+- play an artist:        `/home/iva/.local/bin/iva-spotify artist <name>`  (their top tracks; e.g. `artist coldplay`)
+- play an album:         `/home/iva/.local/bin/iva-spotify album <name>`
+- play a playlist:       `/home/iva/.local/bin/iva-spotify playlist <name>`
+- pause:               `/home/iva/.local/bin/iva-spotify pause`
+- resume / unpause:    `/home/iva/.local/bin/iva-spotify resume`
+- next track:          `/home/iva/.local/bin/iva-spotify next`
+- previous track:      `/home/iva/.local/bin/iva-spotify prev`
+- what's playing:      `/home/iva/.local/bin/iva-spotify now-playing`
+
+`play` prints `playing <track> — <artist> on Sony HTS`; the others print a short
+status. Confirm in one short spoken sentence (e.g. "Playing Bohemian Rhapsody by
+Queen."); don't read the command aloud. For loudness use the `iva-volume` helper.
+See the `spotify` skill for the full contract.
+
 ## Calling skills that don't expose direct tools
 
 For productivity / API skills like `google-workspace`, `notion`, `linear`,
