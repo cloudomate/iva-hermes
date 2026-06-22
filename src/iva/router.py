@@ -44,12 +44,19 @@ _SYS = (
     "You are Iva, a hands-free voice assistant on a Raspberry Pi. Listen to "
     "the user audio. Decide whether you can answer it directly from knowledge "
     "and the conversation, or whether it needs the tool-equipped agent. "
-    "Output EXACTLY these four lines and nothing else:\n"
+    "Output EXACTLY these five lines and nothing else:\n"
     "TRANSCRIPT: <verbatim words>\n"
     "ROUTE: answer or escalate\n"
     "INTENT: continue or drop\n"
+    "BACKGROUND: yes or no\n"
     "REPLY: <text>\n"
     "Rules:\n"
+    "- Transcribe ONLY the speech actually present in THIS audio clip. If the "
+    "audio has no clear, intelligible speech (silence, background noise, a "
+    "cough, music, a TV), output an EMPTY TRANSCRIPT line and ROUTE=escalate. "
+    "NEVER invent words, and NEVER repeat or re-answer an earlier question from "
+    "the conversation when the audio itself is unclear — a false wake-word "
+    "trigger must yield an empty transcript, not the previous turn.\n"
     "- ROUTE=escalate if it needs ANY action or tool: device control (volume, "
     "audio, bluetooth, recording, playback), smart home, timers or reminders, "
     "saving or recalling notes/memories, web or live/up-to-date info, or "
@@ -59,6 +66,14 @@ _SYS = (
     "- If ROUTE=escalate, REPLY is exactly of the form "
     "'Ok, let me <2-5 word action or topic> for you.' "
     "(e.g. 'Ok, let me turn the volume up for you.')\n"
+    "- BACKGROUND=yes ONLY when ROUTE=escalate AND the task is clearly "
+    "long-running or deferred: research or compiling information, monitoring or "
+    "'when X happens', 'let me know / email me when it's done', or an obviously "
+    "multi-minute job. Otherwise BACKGROUND=no. A direct answer is NEVER "
+    "background.\n"
+    "- If BACKGROUND=yes, REPLY is instead a brief ack that you'll work on it "
+    "and report back, of the form 'Ok, I'll <2-5 word action> and let you know.' "
+    "(e.g. 'Ok, I'll research that and let you know.')\n"
     "- INTENT=drop only if the user is ending the conversation (goodbye, "
     "thanks that's all, go to sleep, stop, never mind); else INTENT=continue.\n"
     "- When unsure about ROUTE, choose escalate."
@@ -103,13 +118,18 @@ def _parse(content):
     # (escalate / blank / unexpected) goes to the tool-equipped agent.
     route = "answer" if _grab(content, "ROUTE").lower().startswith("answer") else "escalate"
     intent = "drop" if "drop" in _grab(content, "INTENT").lower() else "continue"
+    # Background only applies to escalated (tool) turns; a direct answer is
+    # always foreground. Default no unless the model clearly said yes.
+    background = (route == "escalate"
+                 and _grab(content, "BACKGROUND").lower().startswith("y"))
     return {"transcript": _grab(content, "TRANSCRIPT"), "route": route,
-            "intent": intent, "reply": _grab(content, "REPLY")}
+            "intent": intent, "background": background,
+            "reply": _grab(content, "REPLY")}
 
 
 def _fallback(reason):
     return {"transcript": "", "route": "escalate", "intent": "continue",
-            "reply": "", "error": reason, "latency": None}
+            "background": False, "reply": "", "error": reason, "latency": None}
 
 
 def route_turn(wav=None, text=None, history=None, cfg=None, timeout=30):
@@ -123,7 +143,7 @@ def route_turn(wav=None, text=None, history=None, cfg=None, timeout=30):
                 b64 = base64.b64encode(f.read()).decode("ascii")
             user_msg = {"role": "user", "content": [
                 {"type": "input_audio", "input_audio": {"data": b64, "format": "wav"}},
-                {"type": "text", "text": "Process the audio. Output the four lines now."},
+                {"type": "text", "text": "Process the audio. Output the five lines now."},
             ]}
         else:
             user_msg = {"role": "user", "content": text or ""}

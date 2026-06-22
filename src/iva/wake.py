@@ -32,6 +32,7 @@ RATE = 16000; BLOCK = 1280
 # defaults; ~/.config/iva-voice/audio.yaml + env (AUDIO_SOURCE/SINK/CHANNELS/
 # WAKE_CH) override. See iva/audio_config.py. ---
 from iva.audio_config import resolve as _resolve_audio
+from iva import bgtask, notify   # background tasks + proactive notify (MVP)
 _AUDIO = _resolve_audio()
 WAKE_CH = _AUDIO["wake_channel"]            # channel read_fl() extracts when multi-channel
 AUDIO_SOURCE = _AUDIO["source"]             # device name substring / index / None=default
@@ -65,6 +66,21 @@ LISTENING_IDLE_TIMEOUT = float(os.environ.get("LISTENING_IDLE_TIMEOUT", "12.0"))
 # goodbye beep tail / ambient room recovery from triggering a false wake right
 # after a session ends.
 SLEEP_QUIET_S = float(os.environ.get("SLEEP_QUIET_S", "2.0"))
+# --- background tasks + proactive notify (see iva/bgtask.py, iva/notify.py) ---
+# IVA_BGTASK=0 disables backgrounding (every escalate runs inline, today's behavior).
+IVA_BGTASK = (os.environ.get("IVA_BGTASK") or "1").strip().lower() not in ("0","false","no","off")
+# "Present" = a wake/turn within this window -> voice-announce a finished task;
+# otherwise fall back to email. Seconds.
+PRESENCE_WINDOW = float(os.environ.get("IVA_PRESENCE_WINDOW", "600"))
+ANNOUNCE_MAXCHARS = int(os.environ.get("IVA_ANNOUNCE_MAXCHARS", "600"))
+# Hint for background turns: be thorough, return a self-contained result (it gets
+# spoken aloud OR emailed). Distinct from VOICE_HINT (terse, voice-only).
+BG_HINT = ("[Background task: complete this fully using your tools, then give a "
+           "clear, self-contained result suitable to be read aloud or emailed. "
+           "Plain text, no markdown.] ")
+announce_q = queue.Queue()        # finished-task announcements awaiting an idle moment
+announce_evt = threading.Event()  # set by a bg worker; wake_listen breaks on it
+_awaiting_cancel = [False]         # True while we've asked "cancel the running task?"
 # Barge-in: how many consecutive over-threshold blocks count as a real
 # *interrupt*. 3 * 80ms ~= 240ms of sustained over-threshold speech — fast
 # enough for a clear "stop" to land while still debouncing single bursts.
@@ -78,6 +94,13 @@ noise_floor = [250.0]                                  # EMA of ambient FL RMS
 NOISE_ALPHA = 0.05
 SPEECH_MULT = float(_AUDIO["speech_mult"] if _AUDIO.get("speech_mult") is not None else 3.5)
 SPEECH_MIN  = float(_AUDIO["speech_min"] if _AUDIO.get("speech_min") is not None else 600)  # absolute floor
+# Minimum cumulative voiced audio for a capture to count as a real turn. A
+# single over-threshold block (cough, click, door slam, wake/sleep-beep tail)
+# used to set speech=True permanently in record_to_silence, so a false wake
+# produced a noise WAV that the router then "transcribed" as the PREVIOUS
+# question (history priming) and re-answered. Require ~0.3s of voiced blocks
+# (~4 * 80ms) so brief transients are dropped before STT/LLM. 0 disables.
+MIN_SPEECH_S = float(os.environ.get("MIN_SPEECH_S", "0.3"))
 def speech_threshold():
     return max(SPEECH_MIN, noise_floor[0] * SPEECH_MULT)
 def _update_noise(rms):
@@ -94,6 +117,8 @@ def publish(state=None, **kw):
     if state is not None: _state["state"]=state; _state["since"]=time.time()
     _state.update(kw); _state["ts"]=time.time()
     try: _state["noise"]=round(noise_floor[0]); _state["thresh"]=round(speech_threshold())
+    except Exception: pass
+    try: _state["bg_task"]=bgtask.status()
     except Exception: pass
     try:
         tmp=STATE_FILE+".tmp"
@@ -117,6 +142,7 @@ def beep(seq):
     except Exception as e: print("[beep]",e,flush=True)
 def beep_wake():  beep([(660,0.10),(990,0.12)])
 def beep_sleep(): beep([(660,0.10),(440,0.14)])
+def beep_notify(): beep([(880,0.09),(660,0.09),(990,0.13)])  # proactive announce chime
 
 publish("loading")
 def _default_wake_models_dir():
@@ -339,6 +365,11 @@ def wake_listen():
     _dbg = os.environ.get("WAKE_DEBUG"); _peak=0.0; _peakt=time.monotonic()
     try:
         while True:
+            # A finished background task wants to announce — break out so the
+            # main loop can speak it (this `finally` closes the input stream
+            # first, so playback won't re-enter PortAudio; constraint #2).
+            if announce_evt.is_set():
+                return "__announce__"
             fl=read_fl(s,ch); draining=time.monotonic()<drain_until
             _wa=np.frombuffer(fl,np.int16).astype(np.float32)
             if _wa.size: _update_noise(float(np.sqrt(np.mean(_wa*_wa))))
@@ -349,7 +380,7 @@ def wake_listen():
                         p=sum(_m._probabilities)/len(_m._probabilities)
                         if p>_peak: _peak=p
                     if hit and not draining:
-                        print(f"[wake] matched {_name}", flush=True); return
+                        print(f"[wake] matched {_name}", flush=True); return "wake"
             if _dbg and (time.monotonic()-_peakt)>=2.0:
                 print(f"[wakedbg] peak prob_mean={_peak:.3f} (cutoff={WAKE_CUTOFF})", flush=True)
                 _peak=0.0; _peakt=time.monotonic()
@@ -459,6 +490,7 @@ def record_to_silence(max_s=15, silence_s=1.2, start_timeout_s=8, rms_thresh=Non
     import soundfile as sf
     os.makedirs("/tmp/hermes_voice", exist_ok=True)
     s, ch = open_input(); frames=[]; speech=False; t0=time.monotonic(); last=t0
+    voiced_blocks=0
     try:
         while True:
             fl = read_fl(s, ch)
@@ -466,7 +498,7 @@ def record_to_silence(max_s=15, silence_s=1.2, start_timeout_s=8, rms_thresh=Non
             if a.size: frames.append(a.copy())
             rms = float(np.sqrt(np.mean(a.astype(np.float32)**2))) if a.size else 0.0
             now = time.monotonic()
-            if rms >= rms_thresh: speech=True; last=now
+            if rms >= rms_thresh: speech=True; last=now; voiced_blocks+=1
             if speech and (now-last) >= silence_s: break
             if (not speech) and (now-t0) >= start_timeout_s: return None
             if (now-t0) >= max_s: break
@@ -474,6 +506,14 @@ def record_to_silence(max_s=15, silence_s=1.2, start_timeout_s=8, rms_thresh=Non
         try: s.stop(); s.close()
         except Exception: pass
     if not speech or not frames: return None
+    # Reject brief transients (cough/click/beep-tail): a real utterance has
+    # well over MIN_SPEECH_S of cumulative voiced audio. Without this a single
+    # over-threshold block produced a noise WAV that the router re-answered as
+    # the previous question (history priming). Each block is BLOCK/RATE s.
+    voiced_s = voiced_blocks * (BLOCK / RATE)
+    if MIN_SPEECH_S > 0 and voiced_s < MIN_SPEECH_S:
+        print(f"[turn] too little speech ({voiced_s:.2f}s < {MIN_SPEECH_S}s); dropping", flush=True)
+        return None
     path = f"/tmp/hermes_voice/turn_{int(t0)}.wav"
     sf.write(path, np.concatenate(frames), RATE, subtype="PCM_16")
     return path
@@ -572,7 +612,11 @@ def _synth_play_worker(text_q, interrupted, playing):
             print("[tts] error:", e, flush=True); playing.clear()
 
 def _persist_history():
-    try: json.dump(history, open(HISTORY_FILE,"w"))
+    # Lock-held + atomic so the background worker's completion append and the
+    # web console don't race the voice loop's writes. See iva/bgtask.py.
+    try:
+        with bgtask.history_lock():
+            bgtask.save_history(history)
     except Exception as _e: print("[hist] save failed:",_e,flush=True)
 
 def _mark_last_assistant_interrupted():
@@ -582,11 +626,77 @@ def _mark_last_assistant_interrupted():
     interrupting utterance as the next user turn, which is signal enough."""
     return
 
+def _speak_blocking(text):
+    """Synthesize + play `text` to completion on the calling thread (reuses the
+    streaming synth worker). For acks, the busy/cancel replies, and proactive
+    announcements — none of which need the full streaming turn machinery."""
+    text = (text or "").strip()[:ANNOUNCE_MAXCHARS]
+    if not text: return
+    interrupted = threading.Event(); playing = threading.Event()
+    tq = queue.Queue()
+    synth = threading.Thread(target=_synth_play_worker, args=(tq, interrupted, playing), daemon=True)
+    synth.start(); tq.put(text); tq.put(None); synth.join()
+
+def _deliver_announcements():
+    """Play queued finished-task announcements (called when idle, between turns)."""
+    announce_evt.clear()
+    while True:
+        try: item = announce_q.get_nowait()
+        except queue.Empty: break
+        msg = (item.get("text") or "").strip()
+        if not msg: continue
+        print(f"[announce] {msg[:80]!r}", flush=True)
+        publish("announcing", reply=msg[:60])
+        beep_notify()
+        _speak_blocking(msg)
+    publish("listening")
+
+def _on_bg_done(task):
+    """Background-worker callback (runs on the bg thread). Context-aware notify:
+    voice-announce if the user seems present, else email; cancelled tasks are
+    silent. See iva/bgtask.py + iva/notify.py."""
+    if task.status == "cancelled":
+        return
+    present = (time.time() - last_activity[0]) < PRESENCE_WINDOW
+    if task.status == "error":
+        msg = f"Sorry, the background task '{task.desc}' ran into a problem."
+        body = task.error or "unknown error"
+    else:
+        msg = task.result or f"I've finished {task.desc}."
+        body = task.result or msg
+    if present:
+        announce_q.put({"text": msg}); announce_evt.set()
+        print(f"[bgtask] notify=voice (present) {task.desc!r}", flush=True)
+        return
+    subj = f"Iva: {'failed' if task.status=='error' else 'finished'} {task.desc[:60]}"
+    if notify.send_email(subj, body, log=lambda m: print(m, flush=True)):
+        print(f"[bgtask] notify=email (away) {task.desc!r}", flush=True)
+    else:
+        # No email available — queue a voice announce for the next idle moment.
+        announce_q.put({"text": msg}); announce_evt.set()
+        print(f"[bgtask] email unavailable; queued voice fallback {task.desc!r}", flush=True)
+
+_KEEP_RE = re.compile(r"\b(no|keep going|keep it|let it|continue|don'?t|leave it|carry on)\b", re.I)
+_CANCEL_RE = re.compile(r"\b(yes|yeah|yep|cancel|stop|abort|kill)\b", re.I)
+def _decide_cancel(text):
+    """Resolve the answer to 'cancel the running task?' locally (no agent).
+    Keep-going wins ties so we never cancel unless clearly asked."""
+    t = text or ""
+    if _KEEP_RE.search(t): return False
+    if _CANCEL_RE.search(t): return True
+    return False
+
 def do_turn(start_timeout_s=8):
     """Run one capture -> STT -> LLM -> TTS turn.
     Returns next_state: 'sleep' | 'stay'. 'stay' means keep the mic open with
     no wake gate; 'sleep' returns to wake-only."""
     global history
+    # Reload the shared history so this turn sees background-task completions and
+    # web-console turns (all write the same locked file). Falls back to in-memory.
+    try:
+        _h = bgtask.load_history()
+        if _h: history = _h
+    except Exception: pass
     publish("recording")
     t_rec0 = time.monotonic()
     wav = record_to_silence(start_timeout_s=start_timeout_s)
@@ -613,27 +723,63 @@ def do_turn(start_timeout_s=8):
     # Whisper remains the STT fallback when the router is off, errors, or
     # didn't hear anything (RELIABILITY CONTRACT in iva/router.py).
     rt_route, rt_intent, rt_reply, text = "escalate", "continue", "", ""
+    rt_bg = False
     if _ROUTER:
         rt = route_turn(wav=wav, history=history, cfg=cfg)
         text = (rt.get("transcript") or "").strip()
         rt_route = rt.get("route") or "escalate"
         rt_intent = rt.get("intent") or "continue"
         rt_reply = (rt.get("reply") or "").strip()
+        rt_bg = bool(rt.get("background"))
         print(f"[router] rec={t_stt0-t_rec0:.2f}s t={rt.get('latency')}s route={rt_route} "
-              f"intent={rt_intent} heard={text!r} reply={rt_reply[:60]!r}"
+              f"intent={rt_intent} bg={rt_bg} heard={text!r} reply={rt_reply[:60]!r}"
               + (f" err={rt['error']}" if rt.get('error') else ""), flush=True)
     if not text:
         # Router off or didn't hear it — classic Whisper path, full agent.
-        rt_route, rt_intent, rt_reply = "escalate", "continue", ""
+        rt_route, rt_intent, rt_reply, rt_bg = "escalate", "continue", "", False
         r = transcribe_audio(wav); text=(r.get("transcript") or "").strip()
         print(f"[t] stt={time.monotonic()-t_stt0:.2f}s text={text!r} wav={wav}", flush=True)
         if not text or is_whisper_hallucination(text):
             print(f"[turn] no usable speech ({text!r})",flush=True); return "sleep"
+    # If we just asked whether to cancel a running background task, resolve the
+    # yes/no locally (no agent round-trip) before anything else.
+    if _awaiting_cancel[0]:
+        _awaiting_cancel[0] = False
+        if bgtask.active() and _decide_cancel(text):
+            bgtask.cancel(log=lambda m: print(m, flush=True))
+            _speak_blocking("Okay, I've cancelled it.")
+        else:
+            _speak_blocking("Okay, I'll keep working and let you know.")
+        return "sleep"
     if rt_intent == "drop" or is_close_intent(text):
+        # Conversation ending. If a background task is still running, ask whether
+        # to cancel it (answer captured next turn) instead of silently sleeping.
+        if IVA_BGTASK and bgtask.active():
+            _awaiting_cancel[0] = True
+            q = f"I'm still working on {bgtask.current_desc()}. Should I cancel it, or keep going?"
+            print(f"[turn] close with bg active -> ask cancel", flush=True)
+            publish("speaking", user=text, reply=q[:60])
+            _speak_blocking(q)
+            return "stay"
         # User closed (router drop, close-intent regex / hallucinated close-phrase).
         # Skip the agent; the sleep beep in the main loop's finally is the ack.
         print(f"[turn] drop/close ({text!r}) -> sleep", flush=True)
         return "sleep"
+    # Long-running request: ack now, run in the background, return to listening.
+    if IVA_BGTASK and rt_bg:
+        if bgtask.active():
+            _speak_blocking(f"I'm still working on {bgtask.current_desc()}. I'll get to that next.")
+            return "stay" if rt_intent == "continue" else "sleep"
+        ack = rt_reply or "Ok, I'll work on that and let you know."
+        snapshot = bgtask.load_history()
+        started = bgtask.dispatch(text, BG_HINT + text, snapshot, _on_bg_done,
+                                  log=lambda m: print(m, flush=True))
+        if started:
+            publish("speaking", user=text, reply=ack[:60])
+            _speak_blocking(ack)
+            last_activity[0] = time.time()
+            return "stay" if rt_intent == "continue" else "sleep"
+        # dispatch lost a race — fall through to a normal foreground turn.
     publish("thinking", user=text)
     # Clear any stale interrupt flag from a previous turn — otherwise the
     # LLM call would abort instantly on a barge-in we already serviced.
@@ -815,7 +961,14 @@ def do_turn(start_timeout_s=8):
 print(f"[ready] listening for '{WAKE_LABEL}'...",flush=True)
 publish("listening")  # initial wake-only state; `finally` handles all subsequent resets
 while True:
-    wake_listen(); _state["wakes"]+=1
+    ev = wake_listen()
+    if ev == "__announce__":
+        # Proactive: a background task finished while we were idle. Speak it,
+        # then go straight back to listening (no wake/sleep beep, no quiet gap).
+        try: _deliver_announcements()
+        except Exception: import traceback; traceback.print_exc()
+        continue
+    _state["wakes"]+=1
     publish("wake"); last_activity[0]=time.time()
     try:
         beep_wake()
