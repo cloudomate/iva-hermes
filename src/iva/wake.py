@@ -73,6 +73,11 @@ IVA_BGTASK = (os.environ.get("IVA_BGTASK") or "1").strip().lower() not in ("0","
 # otherwise fall back to email. Seconds.
 PRESENCE_WINDOW = float(os.environ.get("IVA_PRESENCE_WINDOW", "600"))
 ANNOUNCE_MAXCHARS = int(os.environ.get("IVA_ANNOUNCE_MAXCHARS", "600"))
+# Whisper STT fallback when the router is ON but heard nothing usable. Default
+# OFF: an empty/garbage router transcript DROPS the turn rather than risk a
+# Whisper hallucination on noise / a false wake. IVA_WHISPER_FALLBACK=1 re-enables.
+# (When the router is OFF entirely, Whisper is always the primary STT regardless.)
+WHISPER_FALLBACK = (os.environ.get("IVA_WHISPER_FALLBACK") or "0").strip().lower() in ("1","true","yes","on")
 # Hint for background turns: be thorough, return a self-contained result (it gets
 # spoken aloud OR emailed). Distinct from VOICE_HINT (terse, voice-only).
 BG_HINT = ("[Background task: complete this fully using your tools, then give a "
@@ -735,7 +740,14 @@ def do_turn(start_timeout_s=8):
               f"intent={rt_intent} bg={rt_bg} heard={text!r} reply={rt_reply[:60]!r}"
               + (f" err={rt['error']}" if rt.get('error') else ""), flush=True)
     if not text:
-        # Router off or didn't hear it — classic Whisper path, full agent.
+        # Router on but heard nothing usable. By default DON'T fall back to
+        # Whisper (it hallucinates on noise / false wakes) — just drop the turn.
+        # Whisper is only used when the router is OFF (its primary STT) or when
+        # IVA_WHISPER_FALLBACK=1 explicitly re-enables the fallback.
+        if _ROUTER and not WHISPER_FALLBACK:
+            print("[turn] router heard nothing; whisper fallback off -> sleep", flush=True)
+            return "sleep"
+        # Router off, or fallback explicitly enabled — classic Whisper path.
         rt_route, rt_intent, rt_reply, rt_bg = "escalate", "continue", "", False
         r = transcribe_audio(wav); text=(r.get("transcript") or "").strip()
         print(f"[t] stt={time.monotonic()-t_stt0:.2f}s text={text!r} wav={wav}", flush=True)
