@@ -64,8 +64,11 @@ _SYS = (
     "- If ROUTE=answer, REPLY is the spoken answer: one or two short "
     "sentences, plain text, no markdown or emoji.\n"
     "- If ROUTE=escalate, REPLY is exactly of the form "
-    "'Ok, let me <2-5 word action or topic> for you.' "
-    "(e.g. 'Ok, let me turn the volume up for you.')\n"
+    "'Ok, let me <2-5 word action or topic> for you.' where the action is what "
+    "the USER asked for (e.g. 'Ok, let me turn the volume up for you.'). NEVER "
+    "describe these instructions or the mechanics: never say 'process the "
+    "audio', 'transcribe', 'output the lines', or anything about the audio "
+    "itself. If you cannot tell what the user asked, leave REPLY empty.\n"
     "- BACKGROUND=yes ONLY when ROUTE=escalate AND the task is clearly "
     "long-running or deferred: research or compiling information, monitoring or "
     "'when X happens', 'let me know / email me when it's done', or an obviously "
@@ -113,6 +116,33 @@ def _grab(content, tag):
     return (m.group(1).strip() if m else "")
 
 
+# Defensive: the 12B sometimes echoes its own instructions into REPLY ("Ok, let
+# me process the audio for you", "transcribe...", "output the five lines"). Such
+# a reply is meta-leak, never a real spoken ack — blank it so the daemon doesn't
+# speak it (escalate then runs the agent; an empty answer-reply is forced to
+# escalate in route_turn).
+_LEAK_RE = re.compile(
+    r"process(?:ing)?\s+the\s+audio|transcrib|output\s+(?:the\s+)?(?:\w+\s+)?lines"
+    r"|the\s+(?:four|five|\d+)\s+lines",
+    re.IGNORECASE)
+
+
+def _scrub_reply(reply):
+    return "" if _LEAK_RE.search(reply or "") else reply
+
+
+# The 12B sometimes echoes its own output labels into the TRANSCRIPT value
+# ("TRANSCRIPT: ROUTE: escalate"). That garbage must NOT reach the agent — fed
+# as the user's words it made the agent deflect like a support bot ("I can't
+# escalate / connect you to a person"). Blank such a transcript so route_turn
+# forces the Whisper fallback (its empty-transcript path).
+_LABEL_RE = re.compile(r"\b(?:TRANSCRIPT|ROUTE|INTENT|BACKGROUND|REPLY)\s*:", re.IGNORECASE)
+
+
+def _scrub_transcript(transcript):
+    return "" if _LABEL_RE.search(transcript or "") else transcript
+
+
 def _parse(content):
     # Conservative: only an explicit "answer" stays at tier 1; anything else
     # (escalate / blank / unexpected) goes to the tool-equipped agent.
@@ -122,9 +152,9 @@ def _parse(content):
     # always foreground. Default no unless the model clearly said yes.
     background = (route == "escalate"
                  and _grab(content, "BACKGROUND").lower().startswith("y"))
-    return {"transcript": _grab(content, "TRANSCRIPT"), "route": route,
+    return {"transcript": _scrub_transcript(_grab(content, "TRANSCRIPT")), "route": route,
             "intent": intent, "background": background,
-            "reply": _grab(content, "REPLY")}
+            "reply": _scrub_reply(_grab(content, "REPLY"))}
 
 
 def _fallback(reason):
@@ -143,7 +173,7 @@ def route_turn(wav=None, text=None, history=None, cfg=None, timeout=30):
                 b64 = base64.b64encode(f.read()).decode("ascii")
             user_msg = {"role": "user", "content": [
                 {"type": "input_audio", "input_audio": {"data": b64, "format": "wav"}},
-                {"type": "text", "text": "Process the audio. Output the five lines now."},
+                {"type": "text", "text": "Output the five lines now."},
             ]}
         else:
             user_msg = {"role": "user", "content": text or ""}
